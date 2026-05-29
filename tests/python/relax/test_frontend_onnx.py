@@ -2267,6 +2267,46 @@ def test_layer_norm():
     check_correctness(model)
 
 
+def test_layer_norm_large_float32_values():
+    layer_norm_node = helper.make_node(
+        "LayerNormalization", ["input", "scale", "bias"], ["Y"], axis=-1, epsilon=1e-5
+    )
+
+    graph = helper.make_graph(
+        [layer_norm_node],
+        "layer_norm_large_float32_values_test",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 4]),
+            helper.make_tensor_value_info("scale", TensorProto.FLOAT, [4]),
+            helper.make_tensor_value_info("bias", TensorProto.FLOAT, [4]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4]),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="layer_norm_large_float32_values_test")
+    input_data = np.array([[80000.0, 80001.0, 80002.0, 80003.0]], dtype="float32")
+    tvm_output = run_in_tvm(
+        model,
+        inputs={
+            "input": input_data,
+            "scale": np.ones([4], dtype="float32"),
+            "bias": np.zeros([4], dtype="float32"),
+        },
+        opset=17,
+    )
+    input_data = input_data.astype("float64")
+    centered = input_data - input_data.mean(axis=-1, keepdims=True)
+    expected = (centered / np.sqrt((centered * centered).mean(axis=-1, keepdims=True) + 1e-5)).astype(
+        "float32"
+    )
+
+    actual = tvm_output.numpy()
+    assert np.isfinite(actual).all()
+    tvm.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
+
 def test_layer_norm_with_nd_gamma_beta():
     layer_norm_node = helper.make_node(
         "LayerNormalization", ["input", "scale", "bias"], ["Y"], axis=1, epsilon=1e-12
