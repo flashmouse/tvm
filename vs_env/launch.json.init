@@ -1,0 +1,52 @@
+{
+    // 一次 F5 同时调 Python + C++。
+    // 前提:① VS Code 装 CodeLLDB(vadimcn.vscode-lldb)和 Python 扩展(ms-python.debugpy)
+    //       ② 目标 env 里装了 debugpy:  /Users/lixy/micromamba/envs/tvm-build-venv/bin/python -m pip install debugpy
+    // 用法:打开要调的 .py(如 issue-19578.py)→ 在 Run and Debug 选 "🔧 TVM Debug (Python + C++)" → F5
+    //       Python 断点直接点 .py 行号;C++ 断点直接点 src/**/*.cc 行号(如 create_primfunc.cc)
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // LLDB 启动并“拥有”进程 → 负责 C++ 断点;同时进程内起 debugpy 服务并阻塞等 attach
+            "name": "Py+C++: launch (lldb owns process)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "/Users/lixy/micromamba/envs/tvm-build-venv/bin/python",
+            "args": [
+                "-Xfrozen_modules=off",
+                "-m", "debugpy",
+                "--listen", "5678",
+                "--wait-for-client",
+                "${workspaceFolder}/issue-19578.py"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "TVM_LIBRARY_PATH": "${workspaceFolder}/build/lib",
+                "DYLD_LIBRARY_PATH": "${workspaceFolder}/build/lib"
+            },
+            // 启动前先清掉占用 5678 的僵尸进程,避免端口冲突
+            "preLaunchTask": "free-debugpy-port"
+        },
+        {
+            // debugpy attach 回上面那个进程 → 负责 Python 断点。justMyCode=false 才能步进进 tvm 的 python 代码
+            "name": "Py+C++: attach (debugpy)",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": { "host": "127.0.0.1", "port": 5678 },
+            "justMyCode": false,
+            // 等 LLDB 那边把 python 拉起、debugpy 在 5678 监听后再连,根治 ECONNREFUSED 竞态
+            "preLaunchTask": "wait-for-debugpy"
+        }
+    ],
+    "compounds": [
+        {
+            "name": "🔧 TVM Debug (Python + C++)",
+            "configurations": [
+                "Py+C++: launch (lldb owns process)",
+                "Py+C++: attach (debugpy)"
+            ],
+            // 任一会话停下时另一个也停,退出时一起退
+            "stopAll": true
+        }
+    ]
+}

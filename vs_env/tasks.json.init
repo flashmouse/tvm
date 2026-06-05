@@ -1,0 +1,22 @@
+{
+    // 配合 launch.json 的 compound,解决 debugpy attach 的 ECONNREFUSED 竞态:
+    //   free-debugpy-port : LLDB 启动前先清掉占用 5678 的僵尸进程
+    //   wait-for-debugpy  : debugpy attach 前先等 5678 端口真正监听了再连
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "free-debugpy-port",
+            "type": "shell",
+            "command": "P=$(lsof -nP -iTCP:5678 -t 2>/dev/null); [ -n \"$P\" ] && kill -9 $P 2>/dev/null; pkill -9 -f 'debugpy.*--listen 5678' 2>/dev/null; sleep 0.3; exit 0",
+            "presentation": { "reveal": "silent", "panel": "shared", "close": true },
+            "problemMatcher": []
+        },
+        {
+            "label": "wait-for-debugpy",
+            "type": "shell",
+            "command": "sleep 1; for i in $(seq 1 200); do nc -z 127.0.0.1 5678 2>/dev/null && exit 0; sleep 0.2; done; echo 'timeout: debugpy 没在 5678 监听,看 LLDB 那边(DEBUG CONSOLE)是否启动失败' >&2; exit 1",
+            "presentation": { "reveal": "silent", "panel": "shared", "close": true },
+            "problemMatcher": []
+        }
+    ]
+}
