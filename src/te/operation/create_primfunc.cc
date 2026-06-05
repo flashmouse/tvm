@@ -536,10 +536,63 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
 
   // Step 4. Generate leaf block stmts.
   ffi::Array<Stmt> seq_stmt;
+  ffi::Optional<Stmt> spatial_init{std::nullopt};
   auto leaf = scopes.back();
   ffi::Map<ffi::String, ffi::Any> annotations = GenerateBlockAnnotations(compute_op, info);
   const ReduceNode* reduce = compute_op->body[0].as<ReduceNode>();
   if (reduce) {
+    bool has_empty_reduce_axis = false;
+    for (const IterVar& axis : compute_op->reduce_axis) {
+      if (analyzer->CanProveEqual(axis->dom->extent, 0)) {
+        has_empty_reduce_axis = true;
+        break;
+      }
+    }
+    if (has_empty_reduce_axis) {
+      // Initialize the reduction result over the spatial output domain before entering the
+      // reduction loops.  The regular block init is nested inside the leaf reduction block, so if
+      // any reduction axis has zero extent, that block never executes and the output buffer remains
+      // uninitialized.  Emitting this data-parallel init block preserves the reduction identity for
+      // empty reductions.
+      NestedScopeInfo init_scope;
+      for (const IterVar& axis : compute_op->axis) {
+        DataType index_type = DataType::Int(
+            std::max(axis->dom->min.dtype().bits(), axis->dom->extent.dtype().bits()));
+        Var loop_var = Var(axis->var->name_hint, index_type);
+        Var block_var("v_" + axis->var->name_hint, index_type);
+        Range dom = Range::FromMinExtent(analyzer->Simplify(axis->dom->min),
+                                         analyzer->Simplify(axis->dom->extent));
+        IterVar new_block_iter(dom, block_var, axis->iter_type, axis->thread_tag, axis->span);
+        init_scope.loop_vars.emplace_back(loop_var, dom);
+        init_scope.AddBlockIter(axis, new_block_iter, loop_var);
+      }
+      if (init_scope.block_iters.empty()) {
+        IterVar dummy(Range::FromMinExtent(0, 1), Var("vi", DataType::Int(32)),
+                      IterVarType::kDataPar);
+        init_scope.AddBlockIter(std::nullopt, dummy, 0);
+      }
+      Stmt init_body =
+          GenerateInitStmt(init_scope.store_indices, buffers, reduce, init_scope.axes_remap, info);
+      Stmt init_block =
+          SBlockRealize(/*iter_values=*/init_scope.bindings,
+                        /*predicate=*/const_true(),
+                        /*block=*/
+                        SBlock(/*iter_vars=*/init_scope.block_iters,
+                               /*reads=*/{},
+                               /*writes=*/{},
+                               /*name_hint=*/info->FreshName(compute_op->name + "_init"),
+                               /*body=*/init_body,
+                               /*init=*/std::nullopt,
+                               /*alloc_buffers=*/{},
+                               /*match_buffers=*/{},
+                               /*annotations=*/annotations));
+      for (size_t j = init_scope.loop_vars.size(); j > 0; --j) {
+        const auto& [loop_var, dom] = init_scope.loop_vars[j - 1];
+        init_block = For(loop_var, dom->min, dom->extent, ForKind::kSerial, init_block);
+      }
+      spatial_init = init_block;
+    }
+
     PrimExpr expr_body = compute_op->body[0];
     Stmt init = GenerateInitStmt(leaf.store_indices, buffers, reduce, leaf.axes_remap, info);
     Stmt body =
@@ -616,6 +669,9 @@ Stmt GenerateStmtFromCompute(const te::ComputeOp& compute_op, CreateFuncInfo* in
       const auto& [loop_var, dom] = cur.loop_vars[j - 1];
       body = For(loop_var, dom->min, dom->extent, ForKind::kSerial, body);
     }
+  }
+  if (spatial_init.defined()) {
+    body = SeqStmt::Flatten(spatial_init.value(), body);
   }
   return body;
 }

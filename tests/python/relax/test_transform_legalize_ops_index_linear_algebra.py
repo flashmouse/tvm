@@ -16,8 +16,11 @@
 # under the License.
 # ruff: noqa: E501, F841
 
+import numpy as np
+
 import tvm
 import tvm.testing
+from tvm import relax
 from tvm.ir import Op
 from tvm.relax.transform import LegalizeOps
 from tvm.script import ir as I
@@ -1237,6 +1240,52 @@ def test_data_dependent_attribute():
 
     strided_slice_op = Op.get("relax.strided_slice")
     assert strided_slice_op.get_attr("FDataDependent") is None
+
+
+def _build_and_run(mod, args, target):
+    mod = LegalizeOps()(mod)
+    exe = relax.build(mod, target=target)
+    vm = relax.VirtualMachine(exe, device=tvm.cpu())
+    return vm["main"](*args).numpy()
+
+
+@tvm.testing.parametrize_targets("llvm", "c")
+def test_zero_extent_reduction_identity(target, dev):
+    @I.ir_module
+    class Matmul:
+        @R.function
+        def main(
+            a: R.Tensor((4, 0), "float32"), b: R.Tensor((0, 4), "float32")
+        ) -> R.Tensor((4, 4), "float32"):
+            gv: R.Tensor((4, 4), "float32") = R.matmul(a, b)
+            return gv
+
+    @I.ir_module
+    class Sum:
+        @R.function
+        def main(x: R.Tensor((4, 0), "float32")) -> R.Tensor((4,), "float32"):
+            gv: R.Tensor((4,), "float32") = R.sum(x, axis=[1])
+            return gv
+
+    @I.ir_module
+    class Prod:
+        @R.function
+        def main(x: R.Tensor((4, 0), "float32")) -> R.Tensor((4,), "float32"):
+            gv: R.Tensor((4,), "float32") = R.prod(x, axis=[1])
+            return gv
+
+    empty_lhs = tvm.runtime.tensor(np.zeros((4, 0), "float32"), device=dev)
+    empty_rhs = tvm.runtime.tensor(np.zeros((0, 4), "float32"), device=dev)
+    empty_data = tvm.runtime.tensor(np.zeros((4, 0), "float32"), device=dev)
+
+    matmul_out = _build_and_run(Matmul, [empty_lhs, empty_rhs], target)
+    np.testing.assert_equal(matmul_out, np.zeros((4, 4), "float32"))
+
+    sum_out = _build_and_run(Sum, [empty_data], target)
+    np.testing.assert_equal(sum_out, np.zeros((4,), "float32"))
+
+    prod_out = _build_and_run(Prod, [empty_data], target)
+    np.testing.assert_equal(prod_out, np.ones((4,), "float32"))
 
 
 if __name__ == "__main__":
