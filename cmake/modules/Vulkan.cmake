@@ -29,12 +29,12 @@ if(USE_VULKAN)
   include_directories(SYSTEM ${Vulkan_INCLUDE_DIRS})
   message(STATUS "Build with Vulkan support")
   tvm_file_glob(GLOB COMPILER_VULKAN_SRCS
-    src/target/vulkan/build_vulkan.cc
-    src/target/vulkan/codegen_spirv.cc
-    src/target/vulkan/intrin_rule_spirv.cc
-    src/target/vulkan/ir_builder.cc
-    src/target/vulkan/spirv_support.cc
-    src/target/vulkan/spirv_utils.cc
+    src/backend/vulkan/codegen/build_vulkan.cc
+    src/backend/vulkan/codegen/codegen_spirv.cc
+    src/backend/vulkan/codegen/intrin_rule_spirv.cc
+    src/backend/vulkan/codegen/ir_builder.cc
+    src/backend/vulkan/codegen/spirv_support.cc
+    src/backend/vulkan/codegen/spirv_utils.cc
   )
   list(APPEND COMPILER_SRCS ${COMPILER_VULKAN_SRCS})
   list(APPEND TVM_LINKER_LIBS ${Vulkan_SPIRV_TOOLS_LIBRARY})
@@ -44,7 +44,7 @@ endif(USE_VULKAN)
 if(USE_VULKAN)
   message(STATUS "Build vulkan device runtime")
 
-  tvm_file_glob(GLOB RUNTIME_VULKAN_SRCS src/runtime/vulkan/*.cc)
+  tvm_file_glob(GLOB RUNTIME_VULKAN_SRCS src/backend/vulkan/runtime/*.cc)
 
   add_library(tvm_runtime_vulkan_objs OBJECT ${RUNTIME_VULKAN_SRCS})
   target_link_libraries(tvm_runtime_vulkan_objs PUBLIC tvm_ffi_header)
@@ -55,13 +55,5 @@ if(USE_VULKAN)
   add_library(tvm_runtime_vulkan SHARED $<TARGET_OBJECTS:tvm_runtime_vulkan_objs>)
   list(APPEND TVM_RUNTIME_BACKEND_LIBS tvm_runtime_vulkan)
   target_link_libraries(tvm_runtime_vulkan PUBLIC tvm_runtime ${Vulkan_LIBRARY})
-  set_target_properties(tvm_runtime_vulkan PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-  )
-  install(TARGETS tvm_runtime_vulkan DESTINATION lib${LIB_SUFFIX})
-  if(TVM_BUILD_PYTHON_MODULE)
-    install(TARGETS tvm_runtime_vulkan DESTINATION "lib")
-  endif()
+  tvm_configure_target_library(tvm_runtime_vulkan RUNTIME_MODULE)
 endif(USE_VULKAN)

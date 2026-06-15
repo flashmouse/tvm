@@ -147,16 +147,19 @@ void StmtVisitor::VisitStmt_(const SBlockRealizeNode* op) {
   this->VisitStmt(op->block);
 }
 
-void StmtVisitor::VisitStmt_(const ExecScopeStmtNode* op) {
-  // Visit expressions inside exec_scope (scope_id_def extents); skip deferred
-  // defs whose extents are NullOpt.
-  for (const auto& def : op->exec_scope->scope_id_def) {
-    if (!def->extents.has_value()) continue;
-    for (const auto& e : def->extents.value()) {
+void StmtVisitor::VisitStmt_(const ScopeIdDefStmtNode* op) {
+  // Flat stmt -- no body. Visit extents (skip deferred defs whose extents
+  // are NullOpt) and any preferred_extents.
+  if (op->def->extents.has_value()) {
+    for (const auto& e : op->def->extents.value()) {
       this->VisitExpr(e);
     }
   }
-  this->VisitStmt(op->body);
+  if (op->def->preferred_extents.has_value()) {
+    for (const auto& e : op->def->preferred_extents.value()) {
+      this->VisitExpr(e);
+    }
+  }
 }
 
 void StmtVisitor::VisitStmt_(const tirx::TilePrimitiveCallNode* op) {
@@ -606,46 +609,35 @@ Stmt StmtMutator::VisitStmt_(const SBlockRealizeNode* op) {
   }
 }
 
-Stmt StmtMutator::VisitStmt_(const ExecScopeStmtNode* op) {
-  Stmt body = this->VisitStmt(op->body);
-  // Mutate expressions inside exec_scope.scope_id_def extents; deferred defs
-  // (extents=NullOpt) have nothing to mutate -- pass them through unchanged.
-  ExecScope new_scope = op->exec_scope;
-  bool scope_changed = false;
-  ffi::Array<ScopeIdDef> new_scope_id_def;
-  bool sid_changed = false;
-  for (const auto& def : op->exec_scope->scope_id_def) {
-    if (!def->extents.has_value()) {
-      new_scope_id_def.push_back(def);
-      continue;
+Stmt StmtMutator::VisitStmt_(const ScopeIdDefStmtNode* op) {
+  // Mutate extents and preferred_extents; deferred defs have nothing to
+  // mutate -- pass through.
+  bool changed = false;
+  ffi::Optional<ffi::Array<PrimExpr>> new_extents = op->def->extents;
+  if (op->def->extents.has_value()) {
+    ffi::Array<PrimExpr> new_arr;
+    for (const auto& e : op->def->extents.value()) {
+      PrimExpr ne = this->VisitExpr(e);
+      if (!ne.same_as(e)) changed = true;
+      new_arr.push_back(ne);
     }
-    ffi::Array<PrimExpr> new_def_extents;
-    bool def_ext_changed = false;
-    for (const auto& e : def->extents.value()) {
-      PrimExpr new_e = this->VisitExpr(e);
-      if (!new_e.same_as(e)) def_ext_changed = true;
-      new_def_extents.push_back(new_e);
+    new_extents = new_arr;
+  }
+  ffi::Optional<ffi::Array<PrimExpr>> new_pref = op->def->preferred_extents;
+  if (op->def->preferred_extents.has_value()) {
+    ffi::Array<PrimExpr> new_arr;
+    for (const auto& e : op->def->preferred_extents.value()) {
+      PrimExpr ne = this->VisitExpr(e);
+      if (!ne.same_as(e)) changed = true;
+      new_arr.push_back(ne);
     }
-    if (def_ext_changed) {
-      sid_changed = true;
-      new_scope_id_def.push_back(
-          ScopeIdDef(def->def_ids, new_def_extents, def->scope, def->preferred_extents));
-    } else {
-      new_scope_id_def.push_back(def);
-    }
+    new_pref = new_arr;
   }
-  if (sid_changed) {
-    scope_changed = true;
-    new_scope = ExecScope(op->exec_scope->kind, new_scope_id_def);
-  }
-  if (body.same_as(op->body) && !scope_changed) {
-    return ffi::GetRef<Stmt>(op);
-  } else {
-    auto n = CopyOnWrite(op);
-    n->body = std::move(body);
-    if (scope_changed) n->exec_scope = std::move(new_scope);
-    return Stmt(n);
-  }
+  if (!changed) return ffi::GetRef<Stmt>(op);
+  ScopeIdDef new_def(op->def->def_ids, new_extents, op->def->scope, new_pref);
+  auto n = CopyOnWrite(op);
+  n->def = std::move(new_def);
+  return Stmt(n);
 }
 
 Stmt StmtMutator::VisitStmt_(const tirx::TilePrimitiveCallNode* op) {

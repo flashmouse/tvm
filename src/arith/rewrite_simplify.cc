@@ -26,6 +26,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/cast.h>
+#include <tvm/ir/op.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/op.h>
 
@@ -33,7 +34,6 @@
 #include <tuple>
 #include <utility>
 
-#include "../target/datatype/registry.h"
 #include "../tirx/analysis/check_contains.h"
 #include "conjunctive_normal_form.h"
 #include "const_fold.h"
@@ -2316,7 +2316,11 @@ PrimExpr RewriteSimplifier::Impl::VisitExpr_(const CallNode* op) {
       // the operator overload will eagerly constant fold.
       return op->args[0] << op->args[1];
     }
-  } else if (op->op.same_as(Op::Get("tirx.ceil"))) {
+  }
+  static const Op& ceil_op = Op::Get("tirx.ceil");
+  static const Op& log2_op = Op::Get("tirx.log2");
+  static const Op& clz_op = Op::Get("tirx.clz");
+  if (op->op.same_as(ceil_op)) {
     PrimExpr ceil_arg = op->args[0];
     if (auto arg_int = op->args[0].as<IntImmNode>()) {
       return cast(op->dtype, IntImm(arg_int->dtype, arg_int->value));
@@ -2325,7 +2329,7 @@ PrimExpr RewriteSimplifier::Impl::VisitExpr_(const CallNode* op) {
     } else if (auto arg_call = ceil_arg.as<CallNode>()) {
       // ceil(log2(cast(n,"float64"))) is used as the implementation of
       // topi.math.ceil_log2, and appears in iteration bounds.
-      if (arg_call->op.same_as(Op::Get("tirx.log2"))) {
+      if (arg_call->op.same_as(log2_op)) {
         PrimExpr log_arg = arg_call->args[0];
         if (auto as_float = log_arg.as<FloatImmNode>()) {
           // ceil(log2(n)) can be simplified, and should produce the
@@ -2335,7 +2339,7 @@ PrimExpr RewriteSimplifier::Impl::VisitExpr_(const CallNode* op) {
         }
       }
     }
-  } else if (op->op.same_as(Op::Get("tirx.clz"))) {
+  } else if (op->op.same_as(clz_op)) {
     if (const auto* arg_int = op->args[0].as<IntImmNode>()) {
       int bits = arg_int->dtype.bits();
       if (arg_int->value == 0) return make_const(op->dtype, bits);
@@ -2459,7 +2463,7 @@ void RewriteSimplifier::SetMaximumRewriteSteps(int64_t maximum) {
   impl_->SetMaximumRewriteSteps(maximum);
 }
 
-RewriteSimplifier::RewriteSimplifier(Analyzer* parent) : impl_(new Impl(parent)) {}
+RewriteSimplifier::RewriteSimplifier(AnalyzerObj* parent) : impl_(new Impl(parent)) {}
 
 RewriteSimplifier::~RewriteSimplifier() { delete impl_; }
 

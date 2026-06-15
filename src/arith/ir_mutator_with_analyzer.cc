@@ -24,6 +24,7 @@
 
 #include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/cast.h>
+#include <tvm/ir/op.h>
 #include <tvm/s_tir/stmt.h>
 #include <tvm/tirx/analysis.h>
 #include <tvm/tirx/builtin.h>
@@ -135,13 +136,14 @@ void CollectDerivedConstraintFacts(const PrimExpr& condition, std::vector<PrimEx
   }
 }
 
-void EnterConstraintFacts(WithGroup<ConstraintContext>* constraints, Analyzer* analyzer,
+void EnterConstraintFacts(WithGroup<ConstraintContext>* constraints, AnalyzerObj* analyzer,
                           const PrimExpr& condition) {
-  constraints->Emplace(analyzer, condition);
+  arith::Analyzer analyzer_ref = ffi::GetRef<arith::Analyzer>(analyzer);
+  constraints->Emplace(analyzer_ref, condition);
   std::vector<PrimExpr> derived;
   CollectDerivedConstraintFacts(condition, &derived);
   for (const PrimExpr& fact : derived) {
-    constraints->Emplace(analyzer, fact);
+    constraints->Emplace(analyzer_ref, fact);
   }
 }
 
@@ -163,8 +165,9 @@ ffi::Array<PrimExpr> IRMutatorWithAnalyzer::IterMapSimplifyWithContext(
     pred = pred && val;
   }
   int n = indices.size();
+  arith::Analyzer analyzer_ref = ffi::GetRef<arith::Analyzer>(this->analyzer_);
   ffi::Array<PrimExpr> simplified = arith::IterMapSimplify(
-      indices, this->iter_vars_, pred, arith::IterMapLevel::Surjective, this->analyzer_);
+      indices, this->iter_vars_, pred, arith::IterMapLevel::Surjective, analyzer_ref);
   if (non_trivial_only) {
     for (int i = 0; i < n; ++i) {
       if (simplified[i]->IsInstance<IntImmNode>() && indices[i]->IsInstance<VarNode>()) {
@@ -213,10 +216,10 @@ Stmt IRMutatorWithAnalyzer::VisitStmt_(const IfThenElseNode* op) {
   return constraint_scope_.WithNewScope([&]() -> Stmt {
     PrimExpr condition = this->VisitExpr(op->condition);
     PrimExpr real_condition = condition;
-    static auto op_likely = Op::Get("tirx.likely");
 
     if (auto call = condition.as<CallNode>()) {
-      if (call->op.same_as(op_likely)) {
+      static const Op& likely_op = Op::Get("tirx.likely");
+      if (call->op.same_as(likely_op)) {
         real_condition = call->args[0];
       }
     }
@@ -285,8 +288,8 @@ Stmt IRMutatorWithAnalyzer::VisitStmt_(const SeqStmtNode* op) {
 
 PrimExpr IRMutatorWithAnalyzer::VisitExpr_(const CallNode* op) {
   // add condition context to if_then_else
-  static auto op_if_then_else = Op::Get("tirx.if_then_else");
-  if (op->op.same_as(op_if_then_else)) {
+  static const Op& if_then_else_op = Op::Get("tirx.if_then_else");
+  if (op->op.same_as(if_then_else_op)) {
     PrimExpr cond = this->VisitExpr(op->args[0]);
     PrimExpr true_value, false_value;
     constraint_scope_.WithNewScope([&]() {

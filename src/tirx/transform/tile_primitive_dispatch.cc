@@ -25,6 +25,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/pattern.h>
+#include <tvm/ir/op.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/target/target.h>
 #include <tvm/tirx/builtin.h>
@@ -34,7 +35,6 @@
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
-#include <tvm/tirx/target_builtin/cuda.h>
 #include <tvm/tirx/tirx_op.h>
 #include <tvm/tirx/transform.h>
 
@@ -43,6 +43,7 @@
 #include <utility>
 #include <vector>
 
+#include "../analysis/filter_canonical.h"
 #include "../ir/functor_common.h"
 #include "../ir/tir_visitor_with_path.h"
 
@@ -52,10 +53,11 @@ namespace tirx {
 namespace {
 
 // Gather every ScopeIdDef declared anywhere under a given Stmt, paired with
-// the name of the ExecScope that declared it (for implicit-eval routing).
+// the source stmt node that declared it (for implicit-eval routing). The
+// source is the AttrStmt(kDeviceEntry) marker.
 struct ScopeIdDefWithSource {
   ScopeIdDef def;
-  ffi::String source_scope;
+  const StmtNode* source_stmt;
 };
 
 class ScopeIdDefGather : public StmtExprVisitor {
@@ -66,15 +68,48 @@ class ScopeIdDefGather : public StmtExprVisitor {
     return std::move(gather.out_);
   }
 
-  void VisitStmt_(const ExecScopeStmtNode* op) override {
-    StmtExprVisitor::VisitStmt_(op);
-    for (const auto& def : op->exec_scope->scope_id_def) {
-      out_.push_back({def, op->exec_scope->name()});
+  void VisitStmt_(const AttrStmtNode* op) override {
+    if (op->attr_key == tvm::tirx::attr::kDeviceEntry) {
+      EnterSourceAndPartition(op, [&]() { StmtExprVisitor::VisitStmt_(op); });
+      return;
     }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ScopeIdDefStmtNode* op) override {
+    out_.push_back({op->def, source_stmt_});
+    StmtExprVisitor::VisitStmt_(op);
   }
 
  private:
+  // Visit body with ``src`` as the source-stmt context, then re-order
+  // newly-added defs so direct-children defs come after nested ones —
+  // preserves LIFO order required by ExtractKernelLaunchParams.
+  template <typename F>
+  void EnterSourceAndPartition(const StmtNode* src, F&& visit_body) {
+    const StmtNode* prev_source = source_stmt_;
+    size_t baseline = out_.size();
+    source_stmt_ = src;
+    visit_body();
+    source_stmt_ = prev_source;
+
+    std::vector<ScopeIdDefWithSource> direct;
+    std::vector<ScopeIdDefWithSource> nested;
+    direct.reserve(out_.size() - baseline);
+    for (size_t i = baseline; i < out_.size(); ++i) {
+      if (out_[i].source_stmt == src) {
+        direct.push_back(out_[i]);
+      } else {
+        nested.push_back(out_[i]);
+      }
+    }
+    out_.resize(baseline);
+    out_.insert(out_.end(), nested.begin(), nested.end());
+    out_.insert(out_.end(), direct.begin(), direct.end());
+  }
+
   std::vector<ScopeIdDefWithSource> out_;
+  const StmtNode* source_stmt_ = nullptr;
 };
 
 class ElectSyncFinder : public StmtExprVisitor {
@@ -89,7 +124,15 @@ class ElectSyncFinder : public StmtExprVisitor {
   using StmtExprVisitor::VisitStmt_;
 
   void VisitExpr_(const CallNode* op) final {
-    if (op->op.same_as(tirx::builtin::ptx_elect_sync())) {
+    auto is_canonical_elect_sync = [&]() {
+      static const Op& ptx_elect_sync_op = Op::Get("tirx.ptx_elect_sync");
+      if (op->op.same_as(ptx_elect_sync_op)) return true;
+      if (auto call_op = op->op.as<Op>()) {
+        return call_op.value()->name == "tirx.ptx.elect_sync";
+      }
+      return false;
+    };
+    if (is_canonical_elect_sync()) {
       found_ = true;
       return;
     }
@@ -126,54 +169,66 @@ class ScopeIdVarFinder : public StmtExprVisitor {
   bool found_{false};
 };
 
-// Strip ``scope_id_def`` arrays off every nested ExecScopeStmt; the resolved
-// values are bound at kernel scope via Bind statements emitted separately.
+// Remove any standalone ``ScopeIdDefStmt`` nodes; the resolved values are
+// bound at kernel scope via Bind statements emitted separately.
 class ScopeIdDefRemover : public StmtExprMutator {
  public:
   static Stmt Remove(const Stmt& stmt) { return ScopeIdDefRemover()(stmt); }
 
-  Stmt VisitStmt_(const ExecScopeStmtNode* op) override {
-    Stmt body = StmtExprMutator::VisitStmt(op->body);
-    auto n_scope = ffi::make_object<ExecScopeNode>(*op->exec_scope.as<ExecScopeNode>());
-    n_scope->scope_id_def = {};
-    return ExecScopeStmt(ExecScope(n_scope), body);
+  Stmt VisitStmt_(const ScopeIdDefStmtNode* op) override {
+    // Drop the def stmt by replacing with a no-op Evaluate(0). It will be
+    // flattened away by SeqStmt::Flatten elsewhere or stay as a benign
+    // no-op for downstream passes.
+    return Evaluate(IntImm(DataType::Int(32), 0));
   }
 };
 
 // For implicitly-named ScopeIdDefs (parser-emitted Var("")), inject an
-// Evaluate(var) at the source scope so the binding stays observably live in
-// the IR even if user code never references it.
+// Evaluate(var) at the source stmt's body so the binding stays observably
+// live in the IR even if user code never references it. Routing uses source
+// stmt-node identity to match against the device-entry marker.
 class ImplicitScopeIdEvalInjector : public StmtExprMutator {
  public:
-  static Stmt Inject(const Stmt& stmt, const std::vector<std::pair<Var, ffi::String>>& eval_specs) {
+  static Stmt Inject(const Stmt& stmt,
+                     const std::vector<std::pair<Var, const StmtNode*>>& eval_specs) {
     ImplicitScopeIdEvalInjector injector(eval_specs);
     return injector(stmt);
   }
 
  private:
-  explicit ImplicitScopeIdEvalInjector(const std::vector<std::pair<Var, ffi::String>>& eval_specs) {
-    for (const auto& [var, scope] : eval_specs) {
-      eval_map_[scope.operator std::string()].push_back(var);
+  explicit ImplicitScopeIdEvalInjector(
+      const std::vector<std::pair<Var, const StmtNode*>>& eval_specs) {
+    for (const auto& [var, src] : eval_specs) {
+      eval_map_[src].push_back(var);
     }
   }
 
-  Stmt VisitStmt_(const ExecScopeStmtNode* op) final {
-    Stmt body = VisitStmt(op->body);
-    auto it = eval_map_.find(op->exec_scope->name().operator std::string());
+  ffi::Array<Stmt> ConsumeEvalsFor(const StmtNode* src) {
+    ffi::Array<Stmt> evals;
+    auto it = eval_map_.find(src);
     if (it != eval_map_.end() && !it->second.empty()) {
-      ffi::Array<Stmt> evals;
       evals.reserve(it->second.size());
       for (const Var& var : it->second) {
         evals.push_back(Evaluate(var));
       }
-      body = SeqStmt::Flatten(evals, body);
       eval_map_.erase(it);
     }
-    if (body.same_as(op->body)) return ffi::GetRef<Stmt>(op);
-    return ExecScopeStmt(op->exec_scope, body);
+    return evals;
   }
 
-  std::unordered_map<std::string, std::vector<Var>> eval_map_;
+  Stmt VisitStmt_(const AttrStmtNode* op) final {
+    Stmt body = VisitStmt(op->body);
+    if (op->attr_key == tvm::tirx::attr::kDeviceEntry) {
+      auto evals = ConsumeEvalsFor(op);
+      if (!evals.empty()) {
+        body = SeqStmt::Flatten(evals, body);
+      }
+    }
+    if (body.same_as(op->body)) return ffi::GetRef<Stmt>(op);
+    return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
+  }
+
+  std::unordered_map<const StmtNode*, std::vector<Var>> eval_map_;
 };
 
 }  // namespace
@@ -240,8 +295,9 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     }
 
    private:
-    Stmt VisitStmt_(const tirx::TilePrimitiveCallNode* op) final {
-      if (op->op == tirx::tvm_kernel_replace_point()) {
+    Stmt VisitStmt_(const EvaluateNode* op) final {
+      const auto* call = op->value.as<CallNode>();
+      if (call != nullptr && call->op.same_as(tirx::builtin::tvm_kernel_replace_point())) {
         return body_;
       }
       return StmtExprMutator::VisitStmt_(op);
@@ -250,98 +306,143 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     Stmt body_;
   };
 
-  Stmt VisitStmt_(const ExecScopeStmtNode* op) final {
-    exec_scope_stack_.push_back(op->exec_scope);
-    bool is_kernel = op->exec_scope->kind == ScopeKind::kKernel;
+  Stmt VisitStmt_(const AttrStmtNode* op) final {
+    if (op->attr_key == tirx::attr::kDeviceEntry) {
+      return ProcessDeviceEntry(op);
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt ProcessDeviceEntry(const AttrStmtNode* entry_node) {
+    Stmt body_to_visit = entry_node->body;
+
     bool is_first_block = false;
-    if (is_kernel) {
-      std::swap(is_first_block, is_first_block_);
-    }
+    std::swap(is_first_block, is_first_block_);
 
-    // Per-kernel scope-id resolution state. Populated at kernel entry,
-    // consumed at kernel exit to emit Bind / thread_extent / implicit evals.
     std::vector<std::pair<Var, PrimExpr>> scope_binds;
-    std::vector<std::pair<Var, ffi::String>> implicit_scope_id_evals;
+    std::vector<std::pair<Var, const StmtNode*>> implicit_scope_id_evals;
 
-    bool pushed_base_ctx = false;
-    bool pushed_scope_ctx = false;
-    if (is_kernel) {
-      // Resolve scope-ids: gather, verify, populate launch_params_, build
-      // scope_binds. After this, launch_params_ has threadIdx / blockIdx /
-      // clusterCtaIdx IterVars derivable from the user's ScopeIdDefs.
-      // launch_params_ is cleared first since it accumulates across kernels.
-      launch_params_.clear();
-      ResolveKernelScopeIds(op, &scope_binds, &implicit_scope_id_evals);
-      pushed_base_ctx = PushKernelEntryCtx();
-    } else {
-      pushed_scope_ctx = PushScopeSwitchCtx(op->exec_scope->kind);
-    }
+    launch_params_.clear();
+    // Pre-dispatch: only populate ``launch_params_`` + synthesize
+    // ``warp_id_in_cta``. The dispatch impls (run via ``VisitStmt`` below)
+    // read ``launch_params_`` through ``sctx``, so this much must happen
+    // first. The per-def Bind resolution is deferred to AFTER dispatch so
+    // it can pick up any ``ScopeIdDef`` declared inside dispatched impls.
+    PrepareLaunchParams(entry_node, body_to_visit, &scope_binds);
+    bool pushed_base_ctx = PushKernelEntryCtx();
 
-    Stmt body = VisitStmt(op->body);
+    // Direct ScopeIdDefStmt children of the device-entry marker live here.
+    scope_id_defs_at_level_.push_back({});
+    Stmt body = VisitStmt(body_to_visit);
+    scope_id_defs_at_level_.pop_back();
+
+    // Post-dispatch: re-gather the now-inlined body and resolve every
+    // ``ScopeIdDef`` (kernel-side + dispatch-introduced) into ``scope_binds``.
+    ResolveAllScopeBinds(entry_node, body, &scope_binds, &implicit_scope_id_evals);
 
     auto pop_exec_contexts = [&]() {
-      if (pushed_scope_ctx) ctx_stack_.pop_back();
       if (pushed_base_ctx) ctx_stack_.pop_back();
     };
 
-    if (is_kernel && is_first_block) {
-      // Insert device init stmts into kernel body
-      for (auto it = device_init_stmts_.rbegin(); it != device_init_stmts_.rend(); ++it) {
-        body = KernelReplacePointSearcher::Seek(*it, body);
-      }
-      // Insert alloc buffers at the beginning of the kernel body.
-      if (!alloc_buffers_.empty()) {
-        std::vector<Stmt> seq;
-        seq.reserve(alloc_buffers_.size() + 1);
-        for (const auto& buffer : alloc_buffers_) {
-          seq.push_back(tvm::tirx::AllocBuffer(buffer));
-        }
-        seq.push_back(std::move(body));
-        body = SeqStmt::Flatten(seq);
-      }
-      alloc_buffers_.clear();
-      Stmt res = ExecScopeStmt(op->exec_scope, body);
-
-      // Strip scope_id_def from inner ExecScopeStmts -- their values are now
-      // bound at kernel scope via the Bind statements below.
-      res = ScopeIdDefRemover::Remove(res);
-
-      // Prepend Bind(var, value) for every resolved scope id (and the derived
-      // warp_id_in_cta var when threadIdx is present).
-      ffi::Array<Stmt> bind_stmts;
-      bind_stmts.reserve(scope_binds.size());
-      for (const auto& [var, value] : scope_binds) {
-        bind_stmts.push_back(Bind(var, value));
-      }
-      res = SeqStmt::Flatten(bind_stmts, res);
-
-      // Wrap with thread_extent attrs (consumed by downstream codegen
-      // passes that expect TVM-standard thread launch annotations).
-      for (const auto& [tag, iv] : launch_params_) {
-        if (tag == "warp_id_in_cta") continue;
-        res = AttrStmt(iv, tirx::attr::thread_extent, iv->dom->extent, res);
-      }
-      // Inject implicit scope-id evals (parser-emitted unnamed Vars).
-      res = ImplicitScopeIdEvalInjector::Inject(res, implicit_scope_id_evals);
-
-      // Insert host init stmts outside the outermost thread binding or block.
-      if (is_first_thread_attr_) {
-        for (const auto& stmt : host_init_stmts_) {
-          res = KernelReplacePointSearcher::Seek(stmt, std::move(res));
-        }
-        host_init_stmts_.clear();
-      }
+    if (!is_first_block) {
       std::swap(is_first_block, is_first_block_);
-      exec_scope_stack_.pop_back();
       pop_exec_contexts();
-      return res;
+      if (body.same_as(body_to_visit)) {
+        return ffi::GetRef<Stmt>(entry_node);
+      }
+      return AttrStmt(entry_node->node, entry_node->attr_key, entry_node->value, body,
+                      entry_node->span);
     }
-    exec_scope_stack_.pop_back();
+
+    // Insert device init stmts into kernel body.
+    for (auto it = device_init_stmts_.rbegin(); it != device_init_stmts_.rend(); ++it) {
+      body = KernelReplacePointSearcher::Seek(*it, body);
+    }
+    // Insert alloc buffers at the beginning of the kernel body.
+    if (!alloc_buffers_.empty()) {
+      std::vector<Stmt> seq;
+      seq.reserve(alloc_buffers_.size() + 1);
+      for (const auto& buffer : alloc_buffers_) {
+        seq.push_back(tvm::tirx::AllocBuffer(buffer));
+      }
+      seq.push_back(std::move(body));
+      body = SeqStmt::Flatten(seq);
+    }
+    alloc_buffers_.clear();
+
+    // Partition implicit evals: evals sourced from the device-entry marker
+    // are prepended directly to ``body``. The entry-marker wrapper is
+    // stripped below, so the injector (which matches by source node identity)
+    // can't reach into the stripped node — handle these inline. Evals
+    // sourced from inner ExecScopes (which survive lowering) are still
+    // routed via the injector.
+    {
+      ffi::Array<Stmt> prepend_evals;
+      std::vector<std::pair<Var, const StmtNode*>> remaining;
+      const StmtNode* entry_stmt = static_cast<const StmtNode*>(entry_node);
+      for (const auto& [var, src] : implicit_scope_id_evals) {
+        if (src == entry_stmt) {
+          prepend_evals.push_back(Evaluate(var));
+        } else {
+          remaining.push_back({var, src});
+        }
+      }
+      if (!prepend_evals.empty()) {
+        body = SeqStmt::Flatten(prepend_evals, body);
+      }
+      implicit_scope_id_evals = std::move(remaining);
+    }
+
+    // Strip the device-entry marker; its only role was to scope this
+    // processing. Downstream passes consume the bound launch params and
+    // alloc buffers wrapping ``body`` directly.
+    Stmt res = body;
+
+    // Inject implicit scope-id evals sourced from the device-entry marker.
+    // Must run before ScopeIdDefRemover, which rebuilds nodes and
+    // invalidates source identities.
+    res = ImplicitScopeIdEvalInjector::Inject(res, implicit_scope_id_evals);
+
+    // Strip standalone ScopeIdDefStmt nodes -- their values are now bound at
+    // kernel scope via the Bind statements below.
+    res = ScopeIdDefRemover::Remove(res);
+
+    // Prepend Bind(var, value) for every resolved scope id (and the derived
+    // warp_id_in_cta var when threadIdx is present).
+    ffi::Array<Stmt> bind_stmts;
+    bind_stmts.reserve(scope_binds.size());
+    for (const auto& [var, value] : scope_binds) {
+      bind_stmts.push_back(Bind(var, value));
+    }
+    res = SeqStmt::Flatten(bind_stmts, res);
+
+    // Wrap with thread_extent attrs (consumed by downstream codegen passes
+    // that expect TVM-standard thread launch annotations).
+    for (const auto& [tag, iv] : launch_params_) {
+      if (tag == "warp_id_in_cta") continue;
+      res = AttrStmt(iv, tirx::attr::thread_extent, iv->dom->extent, res);
+    }
+
+    // Insert host init stmts outside the outermost thread binding or block.
+    if (is_first_thread_attr_) {
+      for (const auto& stmt : host_init_stmts_) {
+        res = KernelReplacePointSearcher::Seek(stmt, std::move(res));
+      }
+      host_init_stmts_.clear();
+    }
+    std::swap(is_first_block, is_first_block_);
     pop_exec_contexts();
-    if (body.same_as(op->body)) {
-      return ffi::GetRef<Stmt>(op);
+    return res;
+  }
+
+  Stmt VisitStmt_(const ScopeIdDefStmtNode* op) final {
+    // Register the def at the current (innermost) ExecScope's level so
+    // ResolveScopeIdTarget / ScopeIdTargets can find it. The def remains
+    // visible to subsequent sibling stmts within this scope.
+    if (!scope_id_defs_at_level_.empty()) {
+      scope_id_defs_at_level_.back().push_back(op->def);
     }
-    return ExecScopeStmt(op->exec_scope, body);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const SeqStmtNode* op) final {
@@ -403,10 +504,17 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
 
   Stmt VisitStmt_(const IfThenElseNode* op) final {
     // Narrow ExecContext for structurally recognized predicates on the
-    // then-branch. `Tx.filter` remains accepted as an annotation wrapper, but
-    // ordinary predicates such as `warp_id == 0 and lane_id == 0` are inferred
-    // directly and the wrapper is stripped from executable IR.
-    int pushed_ctx = PushPredicateCtx(op->condition);
+    // then-branch. The canonical-form classifier (filter_canonical.h)
+    // recognizes the dominant shapes: pure conjunctions of `scopeid_var op
+    // const` comparisons plus bare `ptx_elect_sync()` calls. Predicates
+    // outside that grammar (e.g. linear shifts like `v - 1 < 5`, modulo
+    // equality like `v % 2 == 0`, or the legacy `tirx.filter` wrapper) fall
+    // back to the existing dispatcher, which has more permissive matching
+    // paths.
+    int pushed_ctx = TryPushCanonicalCtx(op->condition);
+    if (pushed_ctx < 0) {
+      pushed_ctx = PushPredicateCtx(op->condition);
+    }
     PrimExpr new_cond = RewriteFilterCalls(op->condition);
     Stmt then_case = VisitStmt(op->then_case);
     while (pushed_ctx-- > 0) ctx_stack_.pop_back();
@@ -423,19 +531,27 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
   }
 
   Stmt VisitStmt_(const tirx::TilePrimitiveCallNode* op) final {
+    // Scope is a per-call field on the node. Derive the (inter, intra) split
+    // on the spot from the current active set ``A`` (tracked through control
+    // flow on ``ctx_stack_``) under this call's own ``op->scope``.
     ffi::Map<ffi::String, ffi::Array<PrimExpr>> inter_map, intra_map;
-    // scope_kind always equals the current exec_scope name so dispatchers
-    // can read sctx.scope_kind as a drop-in for sctx.exec_scope.name. When
-    // ExecContext tracking is active the tracked scope_kind wins (identical for
-    // legacy kinds and consistent once predicates change the active set).
-    ffi::String scope_kind = exec_scope_stack_.back()->name();
+    ffi::String scope_kind = ScopeKindToString(op->scope->kind);
     if (!ctx_stack_.empty()) {
-      const auto& ctx = ctx_stack_.back();
-      inter_map = EncodeSplitSide(ctx.split.inter);
-      intra_map = EncodeSplitSide(ctx.split.intra);
-      scope_kind = ScopeKindToString(ctx.scope_kind);
+      ExecSplit split;
+      std::string err;
+      if (ScopeSwitch(ctx_stack_.back().A, op->scope->kind, &split, &err)) {
+        inter_map = EncodeSplitSide(split.inter);
+        intra_map = EncodeSplitSide(split.intra);
+      } else {
+        // Factoring failure (e.g. warpgroup with a lane that crosses a
+        // warpgroup boundary unaligned). Leave the split empty; dispatchers
+        // fall back to scope_kind. This is not validated earlier, so an
+        // incompatible per-call scope only warns here and yields a degenerate
+        // split rather than a hard error.
+        LOG(WARNING) << "ExecContext scope_switch failed: " << err;
+      }
     }
-    tirx::DispatchContext sctx(target_, exec_scope_stack_.back(), launch_params_, var_range_map_,
+    tirx::DispatchContext sctx(target_, op->scope, launch_params_, var_range_map_,
                                /*alloc_only=*/false, /*callbacks=*/{}, shared_state_, inter_map,
                                intra_map, scope_kind);
     static auto f_op_dispatcher_ = ffi::Function::GetGlobal("tirx.f_op_dispatcher");
@@ -471,17 +587,20 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
 
   // --- Scope-id resolution at kernel scope ----------------------------------
 
-  // Gather + verify ScopeIdDefs, build launch_params_ from the canonical
-  // bindings, and append (Var, value) pairs to *scope_binds. Implicit
-  // (unnamed) scope-id Vars are recorded for later evaluate-injection.
-  void ResolveKernelScopeIds(const ExecScopeStmtNode* op,
-                             std::vector<std::pair<Var, PrimExpr>>* scope_binds,
-                             std::vector<std::pair<Var, ffi::String>>* implicit_scope_id_evals) {
-    std::vector<ScopeIdDefWithSource> gathered = ScopeIdDefGather::Gather(ffi::GetRef<Stmt>(op));
+  // PRE-DISPATCH step: gather + verify ScopeIdDefs on the original kernel
+  // body, populate ``launch_params_`` from the canonical bindings, and
+  // synthesize the ``warp_id_in_cta`` helper bind. The per-def Bind
+  // resolution that used to live here is now in ``ResolveAllScopeBinds``,
+  // which runs AFTER dispatch so it sees ScopeIdDefs introduced by
+  // dispatched impls too.
+  void PrepareLaunchParams(const AttrStmtNode* entry_node, Stmt body,
+                           std::vector<std::pair<Var, PrimExpr>>* scope_binds) {
+    Stmt gather_target = AttrStmt(IntImm(DataType::Int(32), 0), tvm::tirx::attr::kDeviceEntry,
+                                  IntImm(DataType::Bool(), 1), body);
+    std::vector<ScopeIdDefWithSource> gathered = ScopeIdDefGather::Gather(gather_target);
     Array<ScopeIdDef> defs;
     defs.reserve(gathered.size());
     for (const auto& g : gathered) defs.push_back(g.def);
-
     ScopeIdDefVerifier verifier;
     TVM_FFI_ICHECK(verifier.Verify(defs)) << "Inconsistent ScopeIdDef";
 
@@ -496,6 +615,36 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
                       "warp_id_in_cta");
       launch_params_.insert({"warp_id_in_cta", warp_iv});
     }
+  }
+
+  // POST-DISPATCH step: re-gather the now-inlined body (which includes any
+  // ScopeIdDefs introduced inside dispatched impls), verify against the
+  // current launch_params, resolve each def, and push (Var, value) pairs
+  // into ``*scope_binds``. Implicit (unnamed) scope-id Vars are recorded
+  // for later evaluate-injection.
+  void ResolveAllScopeBinds(const AttrStmtNode* entry_node, Stmt body,
+                            std::vector<std::pair<Var, PrimExpr>>* scope_binds,
+                            std::vector<std::pair<Var, const StmtNode*>>* implicit_scope_id_evals) {
+    // Gather from a temporary stmt synthesized as the device-entry marker
+    // so direct ScopeIdDefStmt children are attributed back to entry_node.
+    Stmt gather_target = AttrStmt(IntImm(DataType::Int(32), 0), tvm::tirx::attr::kDeviceEntry,
+                                  IntImm(DataType::Bool(), 1), body);
+    std::vector<ScopeIdDefWithSource> gathered = ScopeIdDefGather::Gather(gather_target);
+    // Remap the synthetic source pointer back to the real entry_node so the
+    // injector matches against the actual node present in the post-processed
+    // IR.
+    const StmtNode* synth_src = static_cast<const StmtNode*>(gather_target.get());
+    for (auto& g : gathered) {
+      if (g.source_stmt == synth_src) {
+        g.source_stmt = static_cast<const StmtNode*>(entry_node);
+      }
+    }
+    Array<ScopeIdDef> defs;
+    defs.reserve(gathered.size());
+    for (const auto& g : gathered) defs.push_back(g.def);
+
+    ScopeIdDefVerifier verifier;
+    TVM_FFI_ICHECK(verifier.Verify(defs)) << "Inconsistent ScopeIdDef";
 
     auto is_implicit = [](const Var& v) { return v->name_hint.empty(); };
     for (const auto& g : gathered) {
@@ -515,7 +664,7 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
       for (size_t i = 0; i < def->def_ids.size(); i++) {
         // Reuse the original Var as the bind target -- no rename, no
         // substitution. The IR already references this Var directly, and
-        // dispatch's filter resolution walks ExecScopeStmt::scope_id_def
+        // dispatch's filter resolution walks ScopeIdDefStmt::def
         // to map Vars back to their ScopeBinding.
         Var bind_var = def->def_ids[i];
         PrimExpr value = resolved[i];
@@ -524,7 +673,7 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
         }
         scope_binds->push_back({bind_var, value});
         if (is_implicit(bind_var)) {
-          implicit_scope_id_evals->push_back({bind_var, g.source_scope});
+          implicit_scope_id_evals->push_back({bind_var, g.source_stmt});
         }
       }
     }
@@ -631,21 +780,6 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     return true;
   }
 
-  bool PushScopeSwitchCtx(ScopeKind new_scope_kind) {
-    if (ctx_stack_.empty()) return false;
-    ExecContext new_ctx;
-    std::string err;
-    if (!ctx_stack_.back().WithScopeSwitch(new_scope_kind, &new_ctx, &err)) {
-      // Factoring failure (e.g. warpgroup case 3 / world scope_switch).
-      // Pause tracking; dispatchers fall back to scope_kind. The verifier
-      // (VerifyTIRxWellFormed) is responsible for catching this earlier.
-      LOG(WARNING) << "ExecContext scope_switch failed: " << err;
-      return false;
-    }
-    ctx_stack_.push_back(new_ctx);
-    return true;
-  }
-
   struct ScopeIdTarget {
     ScopeBinding binding;
     int dim = 0;
@@ -677,8 +811,10 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     const auto* var_node = expr.as<VarNode>();
     if (var_node == nullptr) return std::nullopt;
     Var var = ffi::GetRef<Var>(var_node);
-    for (auto it = exec_scope_stack_.rbegin(); it != exec_scope_stack_.rend(); ++it) {
-      for (const auto& def : (*it)->scope_id_def) {
+    // Walk the parallel ScopeIdDef stack (defs visible at each nesting
+    // level) innermost-first.
+    for (auto it = scope_id_defs_at_level_.rbegin(); it != scope_id_defs_at_level_.rend(); ++it) {
+      for (const auto& def : *it) {
         for (size_t i = 0; i < def->def_ids.size(); ++i) {
           if (def->def_ids[i].same_as(var)) {
             return ScopeIdTarget{def->scope, static_cast<int>(i),
@@ -819,8 +955,8 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
 
   std::vector<std::pair<Var, ScopeIdTarget>> ScopeIdTargets() const {
     std::vector<std::pair<Var, ScopeIdTarget>> out;
-    for (auto it = exec_scope_stack_.rbegin(); it != exec_scope_stack_.rend(); ++it) {
-      for (const auto& def : (*it)->scope_id_def) {
+    for (auto it = scope_id_defs_at_level_.rbegin(); it != scope_id_defs_at_level_.rend(); ++it) {
+      for (const auto& def : *it) {
         for (size_t i = 0; i < def->def_ids.size(); ++i) {
           out.push_back({def->def_ids[i], ScopeIdTarget{def->scope, static_cast<int>(i),
                                                         static_cast<int>(def->def_ids.size())}});
@@ -844,14 +980,14 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
 
   bool TryExtractLinearScopeDiff(const PrimExpr& diff, ScopeIdTarget* target, int64_t* coeff,
                                  int64_t* base) {
-    PrimExpr simplified = analyzer_.Simplify(diff);
+    PrimExpr simplified = analyzer_->Simplify(diff);
     for (const auto& [var, candidate] : ScopeIdTargets()) {
       ffi::Array<PrimExpr> linear = arith::DetectLinearEquation(simplified, {var});
       if (linear.size() != 2) continue;
       int64_t c = 0;
       int64_t b = 0;
-      if (!TryExtractIntImm(analyzer_.Simplify(linear[0]), &c) ||
-          !TryExtractIntImm(analyzer_.Simplify(linear[1]), &b)) {
+      if (!TryExtractIntImm(analyzer_->Simplify(linear[0]), &c) ||
+          !TryExtractIntImm(analyzer_->Simplify(linear[1]), &b)) {
         continue;
       }
       if (c != 1 && c != -1) continue;
@@ -937,7 +1073,7 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     auto maybe_target = ResolveScopeIdTarget(lhs);
     if (!maybe_target) return false;
     int64_t mod_value = 0;
-    if (!TryExtractIntImm(analyzer_.Simplify(rhs), &mod_value) || mod_value <= 0) return false;
+    if (!TryExtractIntImm(analyzer_->Simplify(rhs), &mod_value) || mod_value <= 0) return false;
     *target = *maybe_target;
     *modulus = mod_value;
     return true;
@@ -948,11 +1084,11 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     int64_t modulus = 0;
     int64_t residue = 0;
     if (TryExtractModuloTarget(lhs, &target, &modulus) &&
-        TryExtractIntImm(analyzer_.Simplify(rhs), &residue)) {
+        TryExtractIntImm(analyzer_->Simplify(rhs), &residue)) {
       return TryPushModuloForTarget(target, modulus, residue);
     }
     if (TryExtractModuloTarget(rhs, &target, &modulus) &&
-        TryExtractIntImm(analyzer_.Simplify(lhs), &residue)) {
+        TryExtractIntImm(analyzer_->Simplify(lhs), &residue)) {
       return TryPushModuloForTarget(target, modulus, residue);
     }
     return false;
@@ -1021,18 +1157,9 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
   }
 
   int PushFilterPredicateCtx(const CallNode* call) {
-    TVM_FFI_ICHECK(call->args.size() == 2 || call->args.size() == 3)
-        << "TIRxError: tirx.filter expects (var, lo, hi) or (var, cond); got " << call->args.size()
-        << " args";
+    TVM_FFI_ICHECK_EQ(call->args.size(), 2)
+        << "TIRxError: tirx.filter expects (var, cond); got " << call->args.size() << " args";
     auto target = ResolveScopeIdTarget(call->args[0]);
-    if (call->args.size() == 3) {
-      int64_t lo = 0, hi = 0;
-      if (!target || !TryExtractIntImm(call->args[1], &lo) ||
-          !TryExtractIntImm(call->args[2], &hi)) {
-        return 0;
-      }
-      return TryPushRangeForTarget(*target, lo, hi) ? 1 : 0;
-    }
     if (target && ElectSyncFinder::Contains(call->args[1])) {
       PrimExpr selector = tirx::Call(call->args[0].dtype(), tirx::builtin::selector(),
                                      {call->args[0], call->args[1]});
@@ -1109,6 +1236,127 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
     return pushed;
   }
 
+  // Try to classify `cond` as a canonical thread-filter predicate
+  // (see filter_canonical.h) and narrow the ExecContext on each atom.
+  //
+  // Range atoms that share a ScopeIdTarget are intersected into a single
+  // merged range before being pushed (this mirrors PushConjunctivePredicateCtx
+  // and matters for multi-axis targets like kCtaThread, where pushing the two
+  // half-bounded ranges of e.g. `0 <= tid AND tid < 128` separately would
+  // overflow inside NarrowFlatProductRange).
+  //
+  // If the predicate is not canonical but contains a `ptx_elect_sync()` call,
+  // it is treated as a lane-scope thread filter with the whole predicate
+  // preserved verbatim as the selector argument -- mirroring the legacy
+  // PushFilterPredicateCtx behavior for forms like `elect_sync() != 0` or
+  // `not elect_sync()`.
+  //
+  // Returns:
+  //   -1   `cond` is not canonical and does not contain elect_sync -- caller
+  //        should fall back to the legacy PushPredicateCtx dispatch (which
+  //        handles tirx.filter wrappers, linear shifts, modulo equality).
+  //   >= 0 number of context frames pushed on `ctx_stack_` (may be 0 if all
+  //        atoms were recognized but none could be narrowed -- e.g. a range
+  //        target that overlaps a fixed CTA pair axis).
+  int TryPushCanonicalCtx(const PrimExpr& cond) {
+    if (ctx_stack_.empty()) return -1;
+    ScopeIdPredicate is_scope_id = [this](const Var& v) {
+      return ResolveScopeIdTarget(v).has_value();
+    };
+    auto canonical = TryClassifyCanonical(cond, is_scope_id);
+    if (!canonical) {
+      // Non-canonical fallback: any predicate containing elect_sync is
+      // still a lane-scope thread filter. Push the predicate as an opaque
+      // selector so downstream code-gen can reuse the existing selector
+      // narrowing logic.
+      if (ElectSyncFinder::Contains(cond)) {
+        auto lane = FindLaneScopeVar();
+        if (!lane) return -1;
+        ScopeIdTarget target{ScopeBinding::kWarpThread, 0, 1};
+        PrimExpr selector = tirx::Call(lane->dtype(), tirx::builtin::selector(), {*lane, cond});
+        return TryPushSelectorForTarget(target, selector) ? 1 : 0;
+      }
+      return -1;
+    }
+
+    struct RangeGroup {
+      ScopeIdTarget target;
+      int64_t lo;
+      int64_t hi;
+    };
+    std::vector<RangeGroup> groups;
+    std::vector<const FilterAtom*> elect_atoms;
+    for (const FilterAtom& atom : canonical->atoms) {
+      if (atom.kind == FilterAtomKind::kElectSync) {
+        elect_atoms.push_back(&atom);
+        continue;
+      }
+      auto target = ResolveScopeIdTarget(atom.scopeid_var);
+      if (!target) continue;  // atom recognized but target not in scope
+      bool merged = false;
+      for (auto& g : groups) {
+        if (!SameScopeIdTarget(g.target, *target)) continue;
+        g.lo = std::max(g.lo, atom.lo);
+        g.hi = std::min(g.hi, atom.hi);
+        merged = true;
+        break;
+      }
+      if (!merged) groups.push_back({*target, atom.lo, atom.hi});
+    }
+
+    // Iterative push with progress: some pushes depend on a prior push
+    // (e.g. a flat warpgroup-thread range can only narrow once wgid has
+    // collapsed to a single warpgroup via an equality push). Mirrors the
+    // progress loop in PushConjunctivePredicateCtx.
+    std::vector<bool> consumed(groups.size(), false);
+    int pushed = 0;
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (size_t i = 0; i < groups.size(); ++i) {
+        if (consumed[i]) continue;
+        const auto& g = groups[i];
+        if (g.lo >= g.hi) {
+          consumed[i] = true;  // unsatisfiable; skip
+          continue;
+        }
+        if (TryPushRangeForTarget(g.target, g.lo, g.hi)) {
+          consumed[i] = true;
+          ++pushed;
+          progress = true;
+        }
+      }
+    }
+    for (const FilterAtom* atom : elect_atoms) {
+      if (PushElectSyncAtom(*atom)) ++pushed;
+    }
+    return pushed;
+  }
+
+  bool PushElectSyncAtom(const FilterAtom& atom) {
+    // Bind to lane-in-warp scope. The selector wraps the call with the lane
+    // Var so downstream code generation can reuse the selector(var, pred)
+    // shape produced by PushFilterPredicateCtx.
+    auto lane = FindLaneScopeVar();
+    if (!lane) return false;
+    ScopeIdTarget target{ScopeBinding::kWarpThread, 0, 1};
+    PrimExpr selector =
+        tirx::Call(lane->dtype(), tirx::builtin::selector(), {*lane, atom.elect_sync_call});
+    return TryPushSelectorForTarget(target, selector);
+  }
+
+  std::optional<Var> FindLaneScopeVar() const {
+    // Walk innermost-first; the first single-axis kWarpThread def wins.
+    for (auto it = scope_id_defs_at_level_.rbegin(); it != scope_id_defs_at_level_.rend(); ++it) {
+      for (const auto& def : *it) {
+        if (def->scope != ScopeBinding::kWarpThread) continue;
+        if (def->def_ids.size() != 1) continue;
+        return def->def_ids[0];
+      }
+    }
+    return std::nullopt;
+  }
+
   int PushPredicateCtx(const PrimExpr& pred) {
     if (ctx_stack_.empty()) return 0;
     if (const auto* and_node = pred.as<AndNode>()) {
@@ -1128,13 +1376,8 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
   }
 
   PrimExpr RewriteFilterCall(const CallNode* call) const {
-    TVM_FFI_ICHECK(call->args.size() == 2 || call->args.size() == 3)
-        << "TIRxError: tirx.filter expects (var, lo, hi) or (var, cond); got " << call->args.size()
-        << " args";
-    PrimExpr var = call->args[0];
-    if (call->args.size() == 3) {
-      return PrimExpr((var >= call->args[1]) && (var < call->args[2]));
-    }
+    TVM_FFI_ICHECK_EQ(call->args.size(), 2)
+        << "TIRxError: tirx.filter expects (var, cond); got " << call->args.size() << " args";
     return AsBool(call->args[1]);
   }
 
@@ -1176,7 +1419,10 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
   ffi::Map<Var, Range> var_range_map_;
   arith::Analyzer analyzer_;
   const Target& target_;
-  std::vector<ExecScope> exec_scope_stack_;
+  // List of ScopeIdDefs visible at each nesting level (one entry for the
+  // device-entry body itself, plus one per ScopeIdDefStmt-bearing region).
+  // Grows as ScopeIdDefStmt nodes are visited.
+  std::vector<std::vector<ScopeIdDef>> scope_id_defs_at_level_;
   std::vector<ExecContext> ctx_stack_;
   std::unordered_map<ffi::String, IterVar> launch_params_;
   std::vector<Buffer> alloc_buffers_;
@@ -1215,41 +1461,6 @@ class TilePrimitiveDispatcher : public StmtExprMutator {
   }
 
   // No failure aggregation; pass surfaces per-op exceptions
-};
-
-class ScopeMerger : public StmtExprMutator {
- public:
-  static Stmt Merge(const Stmt& stmt) { return ScopeMerger()(stmt); }
-
- private:
-  Stmt VisitStmt_(const SeqStmtNode* op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    if (auto* n = stmt.as<SeqStmtNode>()) {
-      std::vector<Stmt> seq;
-      for (size_t i = 0; i < n->seq.size();) {
-        if (auto* exec_scope_stmt = n->seq[i].as<ExecScopeStmtNode>()) {
-          // Find a sequence of ExecScopeStmts with the same exec_scope
-          std::vector<Stmt> new_body{exec_scope_stmt->body};
-          auto scope = exec_scope_stmt->exec_scope;
-          for (i++; i < n->seq.size(); i++) {
-            if (auto* next_exec_scope = n->seq[i].as<ExecScopeStmtNode>()) {
-              if (scope->kind == next_exec_scope->exec_scope->kind) {
-                new_body.push_back(next_exec_scope->body);
-                continue;
-              }
-            }
-            break;
-          }
-          seq.push_back(ExecScopeStmt(scope, SeqStmt::Flatten(new_body)));
-        } else {
-          seq.push_back(n->seq[i]);
-          i++;
-        }
-      }
-      return SeqStmt::Flatten(seq);
-    }
-    return stmt;
-  };
 };
 
 namespace {

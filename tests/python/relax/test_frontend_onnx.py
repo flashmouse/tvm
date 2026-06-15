@@ -25,9 +25,13 @@ This file is a test script to test Relax ONNX frontend coverage.
 from typing import Literal
 
 import numpy as np
+import pytest
+
+pytest.importorskip("onnx")
+pytest.importorskip("onnxruntime")
+
 import onnx
 import onnxruntime
-import pytest
 import tvm_ffi
 from onnx import ModelProto, TensorProto, helper, numpy_helper
 
@@ -771,6 +775,35 @@ def test_unary(op_name: str):
     verify_unary(op_name, [8, 8, 8], input_dtype=input_dtype, output_dtype=output_dtype)
 
 
+def test_sign_nan_preserve():
+    sign_node = helper.make_node("Sign", ["x"], ["y"])
+    graph = helper.make_graph(
+        [sign_node],
+        "sign_nan_test",
+        inputs=[helper.make_tensor_value_info("x", TensorProto.FLOAT, [4])],
+        outputs=[helper.make_tensor_value_info("y", TensorProto.FLOAT, [4])],
+    )
+    model = helper.make_model(graph, producer_name="sign_nan_test")
+    model.ir_version = 8
+    for opset_import in model.opset_import:
+        if opset_import.domain in ["", "ai.onnx"]:
+            opset_import.version = 18
+            break
+    x = np.array([np.nan, 9.0, -9.0, np.nan], dtype=np.float32)
+
+    ort_out = onnxruntime.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    ).run([], {"x": x})[0]
+
+    tvm_out = run_in_tvm(model, inputs={"x": x}, opset=18)
+    out_np = (tvm_out[0] if isinstance(tvm_out, list | tuple) else tvm_out).numpy()
+
+    np.testing.assert_array_equal(np.isnan(out_np), np.isnan(ort_out))
+    np.testing.assert_allclose(
+        out_np[~np.isnan(ort_out)], ort_out[~np.isnan(ort_out)], rtol=1e-7, atol=1e-5
+    )
+
+
 @pytest.mark.parametrize("op_name", ["Softmax", "LogSoftmax", "Hardmax"])
 def test_softmax_family_opset11_default_axis_semantics(op_name: str):
     verify_unary(op_name, [2, 3, 4], opset=11)
@@ -861,6 +894,37 @@ def test_cast(from_type, to_type):
 
     model = helper.make_model(graph, producer_name="cast_test")
     check_correctness(model, opset=13)
+
+
+@pytest.mark.parametrize("to_type", [TensorProto.INT64, TensorProto.UINT64])
+def test_cast_float_to_64bit_int_dynamic(to_type):
+    cast_node = helper.make_node("Cast", ["a"], ["b"], to=to_type)
+    graph = helper.make_graph(
+        [cast_node],
+        "cast_float_to_64bit_int_dynamic_test",
+        inputs=[helper.make_tensor_value_info("a", TensorProto.FLOAT, [1, 8])],
+        outputs=[helper.make_tensor_value_info("b", to_type, [1, 8])],
+    )
+    model = helper.make_model(graph, producer_name="cast_float_to_64bit_int_dynamic_test")
+    inputs = {"a": np.array([[0.0, 1.2, 2.8, 7.9, 15.1, 31.7, 63.4, 127.9]], dtype=np.float32)}
+    check_correctness(model, inputs=inputs, opset=13, check_dtypes=True)
+
+
+def test_cast_nan_inf_to_int8():
+    vals = np.array([300.0, np.nan, np.inf, -np.inf, 50.0, -50.0], dtype=np.float32)
+    node = helper.make_node("Cast", inputs=["a"], outputs=["b"], to=TensorProto.INT8)
+    graph = helper.make_graph(
+        [node],
+        "cast_nan_inf_test",
+        inputs=[helper.make_tensor_value_info("a", TensorProto.FLOAT, list(vals.shape))],
+        outputs=[helper.make_tensor_value_info("b", TensorProto.INT8, list(vals.shape))],
+    )
+    model = helper.make_model(graph, producer_name="cast_nan_inf_test")
+    tvm_output = run_in_tvm(model, inputs={"a": vals}, opset=13)
+    out_np = tvm_output.numpy()
+    expected = np.array([44, 0, 0, 0, 50, -50], dtype=np.int8)
+    assert out_np.dtype == np.int8
+    np.testing.assert_array_equal(out_np, expected)
 
 
 def test_gather():
@@ -1937,7 +2001,7 @@ def test_pow():
 
 
 @pytest.mark.parametrize("reverse", [True, False])
-@pytest.mark.parametrize("exclusive", [False])
+@pytest.mark.parametrize("exclusive", [True, False])
 def test_cumsum(reverse, exclusive):
     cumsum_node = helper.make_node(
         "CumSum", ["x", "axis"], ["y"], reverse=reverse, exclusive=exclusive
@@ -2265,6 +2329,72 @@ def test_layer_norm():
 
     model = helper.make_model(graph, producer_name="layer_norm_test")
     check_correctness(model)
+
+    # No bias with a non-square input where data.shape[1] differs from the scale
+    # shape, see https://github.com/apache/tvm/issues/19691.
+    layer_norm_node = helper.make_node(
+        "LayerNormalization", ["input", "scale"], ["Y"], axis=-1, epsilon=1e-12
+    )
+
+    graph = helper.make_graph(
+        [layer_norm_node],
+        "layer_norm_test",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT, [2, 3, 4, 8]),
+            helper.make_tensor_value_info("scale", TensorProto.FLOAT, [8]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3, 4, 8]),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="layer_norm_test")
+    check_correctness(model)
+
+    # No bias with a non-square fp16 input. The synthesized zero bias must match
+    # the scale dtype, otherwise layer_norm rejects the float32 bias, see
+    # https://github.com/apache/tvm/issues/19691.
+    layer_norm_node = helper.make_node(
+        "LayerNormalization", ["input", "scale"], ["Y"], axis=-1, epsilon=1e-12
+    )
+
+    graph = helper.make_graph(
+        [layer_norm_node],
+        "layer_norm_test",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.FLOAT16, [2, 3, 4, 8]),
+            helper.make_tensor_value_info("scale", TensorProto.FLOAT16, [8]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [2, 3, 4, 8]),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="layer_norm_test")
+    check_correctness(model, opset=17, atol=1e-2, rtol=1e-2)
+
+    # Same no-bias path for bf16. ONNX Runtime's CPU provider has no bf16
+    # LayerNormalization kernel, so this only checks the importer builds the
+    # graph with a bf16 zero bias (the dtype the fix derives from the scale).
+    layer_norm_node = helper.make_node(
+        "LayerNormalization", ["input", "scale"], ["Y"], axis=-1, epsilon=1e-12
+    )
+
+    graph = helper.make_graph(
+        [layer_norm_node],
+        "layer_norm_test",
+        inputs=[
+            helper.make_tensor_value_info("input", TensorProto.BFLOAT16, [2, 3, 4, 8]),
+            helper.make_tensor_value_info("scale", TensorProto.BFLOAT16, [8]),
+        ],
+        outputs=[
+            helper.make_tensor_value_info("Y", TensorProto.BFLOAT16, [2, 3, 4, 8]),
+        ],
+    )
+
+    model = helper.make_model(graph, producer_name="layer_norm_test")
+    model.opset_import[0].version = 17
+    from_onnx(model, opset=17, keep_params_in_input=True)
 
 
 def test_layer_norm_with_nd_gamma_beta():

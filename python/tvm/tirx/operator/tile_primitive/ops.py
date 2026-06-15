@@ -19,12 +19,12 @@
 
 from tvm.ir import Op
 from tvm.tirx import PrimExpr
-from tvm.tirx.stmt import TilePrimitiveCall, _ffi_api, normalize_const_arg
+from tvm.tirx.stmt import TilePrimitiveCall
 
 
 def get_tirx_op(op_name: str):
     assert isinstance(op_name, str)
-    return Op.get("tirx." + op_name)
+    return Op.get("tirx.tile." + op_name)
 
 
 class ArgProperty:
@@ -410,22 +410,6 @@ class Select(BinaryOp):
     predicate = ArgProperty(3)
 
 
-class KernelReplacePoint(TilePrimitiveCall):
-    """A placeholder for kernel replacement points in TIR scheduling."""
-
-    op = get_tirx_op("tvm_kernel_replace_point")
-
-    @property
-    def srcs(self) -> list[PrimExpr]:
-        """Get the source expressions (inputs) of the operator."""
-        return []
-
-    @property
-    def dsts(self) -> list[PrimExpr]:
-        """Get the destination expressions (outputs) of the operator."""
-        return []
-
-
 ### Compose Ops ###
 class BinaryReduce(TilePrimitiveCall):
     """Combine a binary operation with a reduction operation.
@@ -551,46 +535,33 @@ class ComposeOp(TilePrimitiveCall):
         )
 
 
-class PermuteDims(TilePrimitiveCall):
-    """Permute the tensor dimensions with given order."""
+class PermuteLayout(TilePrimitiveCall):
+    """Move data so the buffer's bytes are arranged under a different layout.
 
-    op = get_tirx_op("permute_dims")
+    Logical shape is preserved; only the byte placement changes. ``dst`` and
+    ``src`` carry their own TileLayouts; on lowering, the dispatcher reads
+    those layouts and emits a register-staged warp transpose, optionally
+    inserting a bank-conflict-avoiding XOR-swizzle on the per-lane register
+    slots.
 
-    order = ArgProperty(1)
+    Args: ``permute_layout(dst_region, src_region)``.
+    ``dst`` and ``src`` may alias the same underlying SMEM (in-place).
+    """
+
+    op = get_tirx_op("permute_layout")
 
     @property
-    def buffer(self) -> PrimExpr:
-        """Get the source expressions (inputs) of the operator."""
+    def dst(self) -> PrimExpr:
         return self.args[0]
 
     @property
+    def src(self) -> PrimExpr:
+        return self.args[1]
+
+    @property
     def srcs(self) -> list[PrimExpr]:
-        """Get the source expressions (inputs) of the operator."""
-        return [self.buffer]
+        return [self.src]
 
     @property
     def dsts(self) -> list[PrimExpr]:
-        """Get the destination expressions (outputs) of the operator."""
-        return [self.buffer]
-
-
-class GenericOp(TilePrimitiveCall):
-    """Generic operator for dynamically-resolved TIRx ops."""
-
-    def __init__(self, *args, op_name=None, workspace=None, config=None, dispatch=None):
-        workspace = workspace or {}
-        config = config or {}
-        tirx_name = f"tirx.{op_name}"
-        try:
-            resolved_op = Op.get(tirx_name)
-        except Exception:
-            from tvm.ir import _ffi_api as ir_ffi
-            from tvm.ir.op import register_op_attr
-
-            ir_ffi.RegisterOp(tirx_name, f"Dynamic tirx op: {op_name}")
-            register_op_attr(tirx_name, "TIsTIRxOp", True)
-            resolved_op = Op.get(tirx_name)
-        args = list(map(normalize_const_arg, args))
-        self.__init_handle_by_constructor__(
-            _ffi_api.TilePrimitiveCall, resolved_op, args, workspace, config, dispatch
-        )
+        return [self.dst]

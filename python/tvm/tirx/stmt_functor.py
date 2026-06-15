@@ -53,7 +53,7 @@ class StmtFunctor:
             "tirx.Evaluate": self.visit_evaluate_,
             "tirx.SBlock": self.visit_block_,
             "tirx.SBlockRealize": self.visit_block_realize_,
-            "tirx.ExecScopeStmt": self.visit_exec_scope_stmt_,
+            "tirx.ScopeIdDefStmt": self.visit_scope_id_def_stmt_,
             "tirx.TilePrimitiveCall": self.visit_op_call_,
             "tirx.AllocBuffer": self.visit_alloc_buffer_,
         }
@@ -172,8 +172,8 @@ class StmtFunctor:
         """Visitor for BlockRealize nodes."""
         return self.visit_stmt_default_(op)
 
-    def visit_exec_scope_stmt_(self, op):
-        """Visitor for ExecScopeStmt nodes."""
+    def visit_scope_id_def_stmt_(self, op):
+        """Visitor for ScopeIdDefStmt nodes."""
         return self.visit_stmt_default_(op)
 
     def visit_op_call_(self, op):
@@ -334,9 +334,22 @@ class StmtVisitor(StmtFunctor):
         self.visit_expr(op.predicate)
         self.visit_stmt(op.block)
 
-    def visit_exec_scope_stmt_(self, op):
-        """Visitor implementation for ExecScopeStmt."""
-        self.visit_stmt(op.body)
+    def visit_scope_id_def_stmt_(self, op):
+        """Visitor implementation for ScopeIdDefStmt.
+
+        Mirrors the C++ visitor: walk extents and preferred_extents via
+        ``visit_expr``; there is no body to recurse into (the def vars
+        themselves are leaves the visitor doesn't otherwise inspect).
+        """
+        # The C++ field is named ``def``, which is a Python keyword,
+        # so it's accessed via ``getattr``.
+        sid = getattr(op, "def")
+        if sid.extents is not None:
+            for e in sid.extents:
+                self.visit_expr(e)
+        if sid.preferred_extents is not None:
+            for e in sid.preferred_extents:
+                self.visit_expr(e)
 
     def visit_op_call_(self, op):
         """Visitor implementation for TilePrimitiveCall."""
@@ -772,14 +785,38 @@ class StmtMutator(StmtFunctor):
 
         return tvm.tirx.SBlockRealize(iter_values, predicate, block)
 
-    def visit_exec_scope_stmt_(self, op):
-        """Mutator implementation for ExecScopeStmt."""
-        body = self.visit_stmt(op.body)
+    def visit_scope_id_def_stmt_(self, op):
+        """Mutator implementation for ScopeIdDefStmt.
 
-        if body is op.body:
+        Mirrors the C++ mutator: rewrite ``extents`` and
+        ``preferred_extents`` via ``visit_expr``. Deferred-extent defs
+        (extents is None) and unchanged extents pass through.
+        """
+        from .exec_scope import _SCOPE_BINDING_TO_PARENT_CUR, ScopeIdDef
+
+        # ``def`` is a Python keyword; access the C++ field via ``getattr``.
+        sid = getattr(op, "def")
+        changed = False
+
+        def _walk(arr):
+            nonlocal changed
+            if arr is None:
+                return None
+            out = []
+            for e in arr:
+                ne = self.visit_expr(e)
+                if ne is not e:
+                    changed = True
+                out.append(ne)
+            return out
+
+        new_extents = _walk(sid.extents)
+        new_pref = _walk(sid.preferred_extents)
+        if not changed:
             return op
-
-        return tvm.tirx.ExecScopeStmt(op.exec_scope, body, op.span)
+        parent, cur = _SCOPE_BINDING_TO_PARENT_CUR[sid.scope]
+        new_def = ScopeIdDef(sid.def_ids, new_extents, parent, cur, new_pref)
+        return tvm.tirx.ScopeIdDefStmt(new_def, op.span)
 
     def visit_op_call_(self, op):
         """Mutator implementation for TilePrimitiveCall."""
@@ -818,7 +855,12 @@ class StmtMutator(StmtFunctor):
             return op
 
         return tvm.tirx.TilePrimitiveCall(
-            *new_args, op=op.op, workspace=op.workspace, config=new_config, dispatch=op.dispatch
+            *new_args,
+            op=op.op,
+            workspace=op.workspace,
+            config=new_config,
+            dispatch=op.dispatch,
+            scope=op.scope,
         )
 
     def visit_buffer_region_(self, op):

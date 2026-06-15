@@ -139,21 +139,6 @@ SBlockFrame Block(ffi::String name, bool no_realize = false, ffi::String exec_sc
 
 void TilePrimitiveCall(tvm::tirx::TilePrimitiveCall op_call);
 
-/*!
- * \brief Create an ExecScopeFrame for execution scope contexts.
- * \param exec_scope_name The name of the execution scope (e.g. "cta", "warp").
- * \return The ExecScopeFrame.
- */
-ExecScopeFrame ExecScopeBlock(ffi::String exec_scope_name,
-                              ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-
-ExecScopeFrame Kernel(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-ExecScopeFrame Cluster(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-ExecScopeFrame WarpGroup(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-ExecScopeFrame CTA(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-ExecScopeFrame Warp(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-ExecScopeFrame Thread(ffi::Array<PrimExpr> guards = ffi::Array<PrimExpr>());
-
 ffi::Array<tvm::tirx::Var> KernelId(ffi::Array<PrimExpr> extents, ffi::String parent);
 
 ffi::Array<tvm::tirx::Var> CtaId(ffi::Array<PrimExpr> extents, ffi::String parent);
@@ -363,6 +348,17 @@ Var Bind(PrimExpr value, ffi::Optional<Type> type_annotation = std::nullopt,
  * \return The result AttrFrame.
  */
 AttrFrame Attr(ffi::Any node, ffi::String attr_key, PrimExpr value);
+
+/*!
+ * \brief Mark the device-region entry within the enclosing PrimFunc body.
+ * Returns an AttrFrame keyed ``tirx.device_entry`` (value ``Bool(true)``).
+ * Subsequent stmts accumulate into the frame's body; the frame is closed
+ * by ``PrimFuncFrameNode::ExitWithScope`` which drains leftover frames.
+ *
+ * Python sugar: ``Tx.device_entry()`` is a flat-call (no ``with``), which
+ * auto-enters the frame.
+ */
+AttrFrame DeviceEntry();
 
 /*!
  * \brief Create a while loop.

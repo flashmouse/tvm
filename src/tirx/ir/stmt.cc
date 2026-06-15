@@ -23,6 +23,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/op.h>
 #include <tvm/tirx/op.h>
 #include <tvm/tirx/op_attr_types.h>
 #include <tvm/tirx/stmt.h>
@@ -52,7 +53,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   MatchBufferRegionNode::RegisterReflection();
   SBlockNode::RegisterReflection();
   SBlockRealizeNode::RegisterReflection();
-  ExecScopeStmtNode::RegisterReflection();
+  ScopeIdDefStmtNode::RegisterReflection();
 }
 
 // Bind
@@ -555,14 +556,14 @@ MatchBufferRegion::MatchBufferRegion(Buffer buffer, BufferRegion source) {
       << source->region.size() << " vs. " << buffer->shape.size();
   size_t offset = source->region.size() - buffer->shape.size();
   for (size_t i = 0; i < offset; ++i) {
-    TVM_FFI_ICHECK(analyzer.CanProve(source->region[i]->extent == 1))
+    TVM_FFI_ICHECK(analyzer->CanProve(source->region[i]->extent == 1))
         << "The higher dimension should be 1, but got " << source->region[i]->extent << ".";
   }
   for (size_t i = 0; i < buffer->shape.size(); ++i) {
     const Range& source_range = source->region[i + offset];
     const PrimExpr& buffer_shape = buffer->shape[i];
     if (!buffer_shape->IsInstance<VarNode>()) {
-      TVM_FFI_ICHECK(analyzer.CanProve(source_range->extent == buffer_shape))
+      TVM_FFI_ICHECK(analyzer->CanProve(source_range->extent == buffer_shape))
           << "The dimension mismatched between source region and target buffer shape, got "
           << source_range->extent << " vs. " << buffer_shape << ".";
     }
@@ -631,22 +632,19 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         });
 }
 
-// ExecScopeStmt
-ExecScopeStmt::ExecScopeStmt(ExecScope exec_scope, Stmt body, Span span) {
-  TVM_FFI_ICHECK(exec_scope.defined());
-  TVM_FFI_ICHECK(body.defined());
-  ffi::ObjectPtr<ExecScopeStmtNode> node = ffi::make_object<ExecScopeStmtNode>();
-  node->exec_scope = std::move(exec_scope);
-  node->body = std::move(body);
+// ScopeIdDefStmt
+ScopeIdDefStmt::ScopeIdDefStmt(ScopeIdDef def, Span span) {
+  TVM_FFI_ICHECK(def.defined());
+  ffi::ObjectPtr<ScopeIdDefStmtNode> node = ffi::make_object<ScopeIdDefStmtNode>();
+  node->def = std::move(def);
   node->span = std::move(span);
   data_ = std::move(node);
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tirx.ExecScopeStmt", [](ExecScope exec_scope, Stmt body, Span span) {
-    return ExecScopeStmt(exec_scope, body, span);
-  });
+  refl::GlobalDef().def("tirx.ScopeIdDefStmt",
+                        [](ScopeIdDef def, Span span) { return ScopeIdDefStmt(def, span); });
 }
 
 // BlockRealize
@@ -673,8 +671,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 }
 
 PrimExpr TypeAnnotation(DataType dtype, Span span) {
-  static auto op = Op::Get("tirx.type_annotation");
-  return tirx::Call(dtype, op, {}, {}, span);
+  static const Op& type_annotation_op = Op::Get("tirx.type_annotation");
+  return tirx::Call(dtype, type_annotation_op, {}, {}, span);
 }
 
 TVM_TIRX_REGISTER_OP("type_annotation")

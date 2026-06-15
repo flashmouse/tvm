@@ -19,7 +19,7 @@
 
 import tvm
 import tvm.testing
-from tvm.script import tirx as Tx
+from tvm.script import tirx as T
 
 
 def _get_source(func: tvm.tirx.PrimFunc) -> str:
@@ -31,28 +31,27 @@ def _get_source(func: tvm.tirx.PrimFunc) -> str:
 
 
 def test_ptx_cp_async_bulk_s2c_codegen():
-    """Test that Tx.ptx.cp_async.bulk.s2c emits the correct PTX instruction."""
+    """Test that T.ptx.cp_async.bulk.s2c emits the correct PTX instruction."""
 
     # fmt: off
-    @Tx.prim_func
-    def main(A: Tx.Buffer((128,), "float16")):
-        with Tx.kernel():
-            cta_id = Tx.cta_id([1])
-            tid = Tx.thread_id([1])
-            with Tx.thread():
-                A_smem = Tx.alloc_shared([128], "float16")
-                for i in Tx.serial(128):
-                    A_smem[i] = A[i]
+    @T.prim_func
+    def main(A: T.Buffer((128,), "float16")):
+        T.device_entry()
+        cta_id = T.cta_id([1])
+        tid = T.thread_id([1])
+        A_smem = T.alloc_shared([128], "float16")
+        for i in T.serial(128):
+            A_smem[i] = A[i]
                 # Use the raw PTX instruction directly
-                dst_ptr = Tx.ptx.map_shared_rank(A_smem.ptr_to([0]), Tx.int32(1))
-                mbar_ptr = Tx.ptx.map_shared_rank(A_smem.ptr_to([0]), Tx.int32(1))
-                Tx.ptx.cp_async.bulk.s2c(
-                    dst_ptr,
-                    A_smem.ptr_to([0]),
-                    Tx.int32(256),  # 128 elements * 2 bytes
-                    mbar_ptr,
-                )
-    # fmt: on
+        dst_ptr = T.ptx.map_shared_rank(A_smem.ptr_to([0]), T.int32(1))
+        mbar_ptr = T.ptx.map_shared_rank(A_smem.ptr_to([0]), T.int32(1))
+        T.ptx.cp_async.bulk.s2c(
+            dst_ptr,
+            A_smem.ptr_to([0]),
+            T.int32(256),  # 128 elements * 2 bytes
+            mbar_ptr,
+        )
+        # fmt: on
 
     src = _get_source(main)
     assert "tvm_builtin_ptx_cp_async_bulk_s2s_cluster" in src
@@ -63,24 +62,23 @@ def test_ptx_cp_async_bulk_s2c_codegen_address_conversion():
     """Test that the codegen correctly converts addresses to shared space."""
 
     # fmt: off
-    @Tx.prim_func
-    def main(A: Tx.Buffer((64,), "float32")):
-        with Tx.kernel():
-            cta_id = Tx.cta_id([1])
-            tid = Tx.thread_id([1])
-            with Tx.thread():
-                A_smem = Tx.alloc_shared([64], "float32")
-                for i in Tx.serial(64):
-                    A_smem[i] = A[i]
-                dst_ptr = Tx.ptx.map_shared_rank(A_smem.ptr_to([0]), Tx.int32(0))
-                mbar_ptr = Tx.ptx.map_shared_rank(A_smem.ptr_to([0]), Tx.int32(0))
-                Tx.ptx.cp_async.bulk.s2c(
-                    dst_ptr,
-                    A_smem.ptr_to([0]),
-                    Tx.int32(256),  # 64 * 4 bytes
-                    mbar_ptr,
-                )
-    # fmt: on
+    @T.prim_func
+    def main(A: T.Buffer((64,), "float32")):
+        T.device_entry()
+        cta_id = T.cta_id([1])
+        tid = T.thread_id([1])
+        A_smem = T.alloc_shared([64], "float32")
+        for i in T.serial(64):
+            A_smem[i] = A[i]
+        dst_ptr = T.ptx.map_shared_rank(A_smem.ptr_to([0]), T.int32(0))
+        mbar_ptr = T.ptx.map_shared_rank(A_smem.ptr_to([0]), T.int32(0))
+        T.ptx.cp_async.bulk.s2c(
+            dst_ptr,
+            A_smem.ptr_to([0]),
+            T.int32(256),  # 64 * 4 bytes
+            mbar_ptr,
+        )
+        # fmt: on
 
     src = _get_source(main)
     # Verify address conversion to shared space

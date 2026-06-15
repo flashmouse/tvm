@@ -16,6 +16,7 @@
 # under the License.
 
 import pytest
+import tvm_ffi
 
 import tvm
 from tvm import te, topi
@@ -144,7 +145,7 @@ def test_expr_constructor():
         attrs={"disable_tma": True},
     )
     assert x_with_attrs.attrs["disable_tma"] is True
-    assert not tvm.ir.structural_equal(x, x_with_attrs)
+    assert not tvm_ffi.structural_equal(x, x_with_attrs)
     script = tvm.tirx.Evaluate(x_with_attrs).script()
     assert "attrs" in script
     assert "disable_tma" in script
@@ -248,7 +249,8 @@ def test_stmt_constructor():
 
 
 def test_float_constructor_requires_float_dtype():
-    with pytest.raises(tvm.TVMError):
+    # FloatImm dtype validation raises a builtin ValueError.
+    with pytest.raises(ValueError):
         tvm.tirx.FloatImm("int32", 1.0)
 
 

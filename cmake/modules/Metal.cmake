@@ -19,7 +19,7 @@ if(USE_METAL)
   message(STATUS "Build metal device runtime")
   find_library(METAL_LIB Metal)
   find_library(FOUNDATION_LIB Foundation)
-  tvm_file_glob(GLOB RUNTIME_METAL_SRCS src/runtime/metal/*.mm)
+  tvm_file_glob(GLOB RUNTIME_METAL_SRCS src/backend/metal/runtime/*.mm)
 
   add_library(tvm_runtime_metal_objs OBJECT ${RUNTIME_METAL_SRCS})
   target_link_libraries(tvm_runtime_metal_objs PUBLIC tvm_ffi_header)
@@ -30,16 +30,8 @@ if(USE_METAL)
   add_library(tvm_runtime_metal SHARED $<TARGET_OBJECTS:tvm_runtime_metal_objs>)
   list(APPEND TVM_RUNTIME_BACKEND_LIBS tvm_runtime_metal)
   target_link_libraries(tvm_runtime_metal PUBLIC tvm_runtime ${METAL_LIB} ${FOUNDATION_LIB})
-  set_target_properties(tvm_runtime_metal PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
-  )
-  install(TARGETS tvm_runtime_metal DESTINATION lib${LIB_SUFFIX})
-  if(TVM_BUILD_PYTHON_MODULE)
-    install(TARGETS tvm_runtime_metal DESTINATION "lib")
-  endif()
+  tvm_configure_target_library(tvm_runtime_metal RUNTIME_MODULE)
 endif(USE_METAL)
 # When USE_METAL=OFF the codegen-side fallback in
-# src/target/metal/metal_fallback_module.cc handles construction; no opt
+# src/backend/metal/codegen/metal_fallback_module.cc handles construction; no opt
 # stub is needed (it is always compiled via CODEGEN_SRCS in CMakeLists.txt).

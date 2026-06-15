@@ -18,7 +18,7 @@
 # pylint: disable=unused-import
 """Common data structures across all IR variants."""
 
-from . import diagnostics, instrument, transform
+from . import instrument, transform
 from .attrs import Attrs, DictAttrs, make_node
 from .base import (
     EnvFunc,
@@ -29,8 +29,6 @@ from .base import (
     assert_structural_equal,
     load_json,
     save_json,
-    structural_equal,
-    structural_hash,
 )
 from .expr import BaseExpr, GlobalVar, PrimExpr, Range, RelaxExpr
 from .function import BaseFunc, CallingConv

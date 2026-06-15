@@ -44,6 +44,7 @@ def _default_globals() -> dict[str, Any]:
         relax,  # pylint: disable=import-outside-toplevel
     )
     from tvm.script.parser import tirx as _tirx_parser  # pylint: disable=import-outside-toplevel
+    from tvm.script.tirx import tile as _tirx_tile  # pylint: disable=import-outside-toplevel
     from tvm.tirx import layout as _tirx_layout  # pylint: disable=import-outside-toplevel
 
     # Expose the layout `Axis` class so printed layout sugar like
@@ -58,7 +59,7 @@ def _default_globals() -> dict[str, Any]:
         "tir": _tirx_parser,
         "R": relax,
         "relax": relax,
-        "Tx": _tirx_dsl,
+        "Tx": _tirx_tile,
         "tirx": _tirx_dsl,
         "Axis": _tirx_layout.Axis,
     }
@@ -129,9 +130,9 @@ def parse(
 
         source_ast = source.as_ast()
 
-        if isinstance(ret, IRModule | tvm.relax.Function) and not tvm.relax.analysis.well_formed(
-            ret
-        ):
+        if isinstance(
+            ret, IRModule | tvm.relax.Function
+        ) and not tvm.relax.analysis.check_well_formed(ret):
             parser.report_error(source_ast, err=WELL_FORMED_ERROR_MESSAGE)
 
         try:

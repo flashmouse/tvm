@@ -231,7 +231,6 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
   void VisitStmt_(const SeqStmtNode* op) override;
   void VisitStmt_(const EvaluateNode* op) override;
   void VisitStmt_(const DeclBufferNode* op) override;
-  void VisitStmt_(const ExecScopeStmtNode* op) override;
 
   // Get constant string
   llvm::Constant* GetConstString(const std::string& str);
@@ -551,7 +550,7 @@ class CodeGenLLVM : public ExprFunctor<llvm::Value*(const PrimExpr&)>,
   // Whether current function is restricted
   bool is_restricted_{true};
   // The analyzer information
-  std::unique_ptr<arith::Analyzer> analyzer_;
+  arith::Analyzer analyzer_;
   // set of var that are not restricted(can alias)
   std::unordered_set<const VarNode*> alias_var_set_;
   // set of volatile buffer.

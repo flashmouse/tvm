@@ -29,24 +29,22 @@
 namespace tvm {
 namespace tirx {
 
-TVM_FFI_STATIC_INIT_BLOCK() {
-  ScheduleContextNode::RegisterReflection();
-  DispatchContextNode::RegisterReflection();
-}
+TVM_FFI_STATIC_INIT_BLOCK() { DispatchContextNode::RegisterReflection(); }
 
 /********************* Utils **********************/
 
-#define TIRX_DEFINE_BUILTIN_FUNC(OpName)            \
-  const Op& OpName() {                              \
-    static const Op& op = Op::Get("tirx." #OpName); \
-    return op;                                      \
-  }                                                 \
-  TVM_REGISTER_OP("tirx." #OpName)                  \
-      .set_attr<TScriptPrinterName>("TScriptPrinterName", ffi::String(#OpName), /*plevel=*/9)
+#define TIRX_DEFINE_TILE_FUNC(OpName)                                                         \
+  const Op& OpName() {                                                                        \
+    static const Op& op = Op::Get("tirx.tile." #OpName);                                      \
+    return op;                                                                                \
+  }                                                                                           \
+  TVM_REGISTER_OP("tirx.tile." #OpName)                                                       \
+      .set_attr<TScriptPrinterName>("TScriptPrinterName", ffi::String(#OpName), /*plevel=*/9) \
+      .set_attr<TIRxOpCategory>("TIRxOpCategory", ffi::String("tile_primitive"), /*plevel=*/9)
 
-#define TIRX_DEFINE_OP(OpName) TIRX_DEFINE_BUILTIN_FUNC(OpName).set_attr<bool>("TIsTIRxOp", true)
+#define TIRX_DEFINE_TILE_OP(OpName) TIRX_DEFINE_TILE_FUNC(OpName)
 
-/********************* ScheduleContext **********************/
+/********************* Context utils **********************/
 template <typename Key, typename Value>
 Value getOrSetDefault(ffi::Map<ffi::String, ffi::ObjectRef>& m, const Key& key,
                       const Value& defaultValue) {
@@ -57,47 +55,6 @@ Value getOrSetDefault(ffi::Map<ffi::String, ffi::ObjectRef>& m, const Key& key,
     return defaultValue;
   }
   return Downcast<Value>((*it).second);
-}
-
-void ScheduleContextNode::AddAllocBuffer(Buffer buffer) {
-  auto buffers = getOrSetDefault(callbacks, callback::kPrivateAlloc, ffi::Array<Buffer>());
-  buffers.push_back(buffer);
-  callbacks.Set(callback::kPrivateAlloc, buffers);
-}
-
-void ScheduleContextNode::AddInitStmt(Stmt stmt, bool host) {
-  auto tag = host ? callback::kHostInitStmt : callback::kDeviceInitStmt;
-  auto stmts = getOrSetDefault(callbacks, tag, ffi::Array<Stmt>());
-  stmts.push_back(stmt);
-  callbacks.Set(tag, stmts);
-}
-
-ScheduleContext::ScheduleContext(Target target, ExecScope exec_scope,
-                                 ffi::Map<ffi::String, IterVar> launch_params,
-                                 ffi::Map<Var, Range> var_range_map, bool alloc_only,
-                                 ffi::Map<ffi::String, ffi::ObjectRef> callbacks) {
-  auto n = ffi::make_object<ScheduleContextNode>();
-  n->target = std::move(target);
-  n->exec_scope = std::move(exec_scope);
-  n->launch_params = std::move(launch_params);
-  n->var_range_map = std::move(var_range_map);
-  n->alloc_only = alloc_only;
-  n->callbacks = std::move(callbacks);
-  data_ = std::move(n);
-}
-
-TVM_FFI_STATIC_INIT_BLOCK() {
-  namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef()
-      .def("tirx.ScheduleContext",
-           [](Target target, ExecScope exec_scope, ffi::Map<ffi::String, IterVar> launch_params,
-              ffi::Map<Var, Range> var_range_map, bool alloc_only,
-              ffi::Map<ffi::String, ffi::ObjectRef> callbacks) {
-             return ScheduleContext(target, exec_scope, launch_params, var_range_map, alloc_only,
-                                    callbacks);
-           })
-      .def_method("tirx.ScheduleContextAddAllocBuffer", &ScheduleContextNode::AddAllocBuffer)
-      .def_method("tirx.ScheduleContextAddInitStmt", &ScheduleContextNode::AddInitStmt);
 }
 
 /********************* DispatchContext **********************/
@@ -183,50 +140,37 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def_method("tirx.DispatchContextSharedStateGet", &DispatchContextNode::SharedStateGet);
 }
 
-/********************* Dispatch Ops **********************/
-#define TIRX_DEFINE_DISPATCH_OP(OpName) TIRX_DEFINE_OP(OpName).set_attr<bool>("TIsDispatchOp", true)
-
-TIRX_DEFINE_DISPATCH_OP(zero);
-TIRX_DEFINE_DISPATCH_OP(sqrt);
-TIRX_DEFINE_DISPATCH_OP(exp);
-TIRX_DEFINE_DISPATCH_OP(exp2);
-TIRX_DEFINE_DISPATCH_OP(add);
-TIRX_DEFINE_DISPATCH_OP(sub);
-TIRX_DEFINE_DISPATCH_OP(mul);
-TIRX_DEFINE_DISPATCH_OP(fdiv);
-TIRX_DEFINE_DISPATCH_OP(minimum);
-TIRX_DEFINE_DISPATCH_OP(maximum);
-TIRX_DEFINE_DISPATCH_OP(copy);
-TIRX_DEFINE_DISPATCH_OP(fill);
-TIRX_DEFINE_DISPATCH_OP(gemm);
-TIRX_DEFINE_DISPATCH_OP(reciprocal);
-TIRX_DEFINE_DISPATCH_OP(sum);
-TIRX_DEFINE_DISPATCH_OP(max);
-TIRX_DEFINE_DISPATCH_OP(min);
-TIRX_DEFINE_DISPATCH_OP(memset);
-TIRX_DEFINE_DISPATCH_OP(reduce_negate);
-TIRX_DEFINE_DISPATCH_OP(binary_reduce);
-TIRX_DEFINE_DISPATCH_OP(unary_reduce);
-TIRX_DEFINE_DISPATCH_OP(binary_chain);
-TIRX_DEFINE_DISPATCH_OP(select);
-TIRX_DEFINE_DISPATCH_OP(cast);
-TIRX_DEFINE_DISPATCH_OP(fma);
-TIRX_DEFINE_DISPATCH_OP(silu);
-TIRX_DEFINE_DISPATCH_OP(permute_dims);
-
-/********************* Compose Ops **********************/
-#define TIRX_DEFINE_COMPOSE_OP(OpName) TIRX_DEFINE_OP(OpName).set_attr<bool>("TIsComposeOp", true)
-
-TIRX_DEFINE_COMPOSE_OP(compose_op);
-
-/********************* Async Ops **********************/
-#define TIRX_DEFINE_ASYNC_OP(OpName) TIRX_DEFINE_OP(OpName).set_attr<bool>("TIsAsyncOp", true)
-
-TIRX_DEFINE_ASYNC_OP(copy_async);
-TIRX_DEFINE_ASYNC_OP(gemm_async);
-
-/********************* Misc Ops **********************/
-TIRX_DEFINE_OP(tvm_kernel_replace_point);
+/********************* Tile Ops **********************/
+TIRX_DEFINE_TILE_OP(zero);
+TIRX_DEFINE_TILE_OP(sqrt);
+TIRX_DEFINE_TILE_OP(exp);
+TIRX_DEFINE_TILE_OP(exp2);
+TIRX_DEFINE_TILE_OP(add);
+TIRX_DEFINE_TILE_OP(sub);
+TIRX_DEFINE_TILE_OP(mul);
+TIRX_DEFINE_TILE_OP(fdiv);
+TIRX_DEFINE_TILE_OP(minimum);
+TIRX_DEFINE_TILE_OP(maximum);
+TIRX_DEFINE_TILE_OP(copy);
+TIRX_DEFINE_TILE_OP(fill);
+TIRX_DEFINE_TILE_OP(gemm);
+TIRX_DEFINE_TILE_OP(reciprocal);
+TIRX_DEFINE_TILE_OP(sum);
+TIRX_DEFINE_TILE_OP(max);
+TIRX_DEFINE_TILE_OP(min);
+TIRX_DEFINE_TILE_OP(memset);
+TIRX_DEFINE_TILE_OP(reduce_negate);
+TIRX_DEFINE_TILE_OP(binary_reduce);
+TIRX_DEFINE_TILE_OP(unary_reduce);
+TIRX_DEFINE_TILE_OP(binary_chain);
+TIRX_DEFINE_TILE_OP(select);
+TIRX_DEFINE_TILE_OP(cast);
+TIRX_DEFINE_TILE_OP(fma);
+TIRX_DEFINE_TILE_OP(silu);
+TIRX_DEFINE_TILE_OP(permute_layout);
+TIRX_DEFINE_TILE_OP(compose_op);
+TIRX_DEFINE_TILE_OP(copy_async);
+TIRX_DEFINE_TILE_OP(gemm_async);
 
 }  // namespace tirx
 }  // namespace tvm

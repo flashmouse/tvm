@@ -16,6 +16,11 @@
 # under the License.
 # pylint: disable=missing-docstring, invalid-name, unused-argument, not-callable
 import numpy as np
+import pytest
+import tvm_ffi
+
+pytest.importorskip("scipy")
+
 from scipy import special
 
 import tvm
@@ -365,7 +370,7 @@ def test_value():
 
         after = generate_take_op.PassReplaceWithTakeOpPrimFuncs()(before)
         target = tvm.target.Target("llvm", host="llvm")
-        ex = tvm.compile(after, target, exec_mode="compiled")
+        ex = tvm.compile(after, target)
         vm = relax.VirtualMachine(ex, tvm.cpu())
         res = vm["main"](inp_quant)
 
@@ -388,5 +393,5 @@ def test_structural():
     ]
     for mod in Modules:
         after = generate_take_op.PassReplaceWithTakeOpPrimFuncs()(mod)
-        assert not tvm.ir.structural_equal(after["main"], mod["main"])
+        assert not tvm_ffi.structural_equal(after["main"], mod["main"])
     print("Passed Structural")

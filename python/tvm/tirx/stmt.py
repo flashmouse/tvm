@@ -39,7 +39,7 @@ from tvm.tirx import FloatImm
 
 from . import _ffi_api
 from .buffer import Buffer
-from .exec_scope import ExecScope
+from .exec_scope import ExecScope, ScopeIdDef
 from .expr import IterVar, StringImm, Var
 
 if TYPE_CHECKING:
@@ -815,35 +815,35 @@ class SBlockRealize(Stmt):
         )  # type: ignore
 
 
-@tvm_ffi.register_object("tirx.ExecScopeStmt")
-class ExecScopeStmt(Stmt):
-    """ExecScopeStmt node.
+@tvm_ffi.register_object("tirx.ScopeIdDefStmt")
+class ScopeIdDefStmt(Stmt):
+    """ScopeIdDefStmt node.
 
-    A statement that annotates the execution scope (e.g. cta, warp, thread)
-    for its body. This decouples the execution scope concept from SBlock.
+    Leaf statement that introduces scope-identifier vars
+    (``wg_id = Tx.warpgroup_id([N])``, ``warp_id = Tx.warp_id_in_wg([4])``,
+    ``lane_id = Tx.lane_id([32])``, …) at the kernel-body top level. The
+    underlying ``ScopeIdDef`` carries the def vars, their extents, and
+    the parent/child scope binding.
+
+    Note: the C++ field is named ``def`` (a Python keyword). Access it
+    via ``getattr(stmt, "def")`` or ``stmt.__getattribute__("def")`` —
+    the type-annotation alias here is purely for documentation.
 
     Parameters
     ----------
-    exec_scope : ExecScope
-        The execution scope.
-
-    body : Stmt
-        The body statement under this execution scope.
+    def_ : ScopeIdDef
+        The scope-id definition (def vars, extents, scope binding).
 
     span : Optional[Span]
         The location of this statement in the source code.
     """
 
-    exec_scope: ExecScope
-    body: Stmt
     span: Span | None
 
-    def __init__(self, exec_scope: ExecScope, body: Stmt, span: Span | None = None) -> None:
-        body = _normalize_legacy_stmt(body)
+    def __init__(self, def_: ScopeIdDef, span: Span | None = None) -> None:
         self.__init_handle_by_constructor__(
-            _ffi_api.ExecScopeStmt,  # type: ignore
-            exec_scope,
-            body,
+            _ffi_api.ScopeIdDefStmt,  # type: ignore
+            def_,
             span,
         )  # type: ignore
 
@@ -942,12 +942,16 @@ class TilePrimitiveCall(Stmt):
 
     dispatch : Optional[str]
         The explicit variant name to dispatch to.
+
+    scope : ExecScope
+        The cooperation scope of this call. Defaults to ``thread`` (an unscoped call).
     """
 
     args: list[PrimExpr]
     workspace: dict[str, Buffer]
     config: dict[str, Any]
     dispatch: str | None
+    scope: ExecScope
     _registry: ClassVar[dict[Op, type["TilePrimitiveCall"]]] = {}
 
     def __init__(
@@ -957,11 +961,14 @@ class TilePrimitiveCall(Stmt):
         workspace: dict[str, Buffer] | None = None,
         config: dict[str, Any] | None = None,
         dispatch: str | None = None,
+        scope: ExecScope | None = None,
     ) -> None:
         if workspace is None:
             workspace = {}
         if config is None:
             config = {}
+        if scope is None:
+            scope = ExecScope("thread")
         if op is None:
             assert self.__class__ != TilePrimitiveCall, (
                 "Directly instantiating TilePrimitiveCall needs to specify the op"
@@ -974,7 +981,8 @@ class TilePrimitiveCall(Stmt):
             args,
             workspace,
             config,
-            dispatch,  # pylint: disable=no-member
+            dispatch,
+            scope,  # pylint: disable=no-member
         )
 
     def __init_subclass__(cls, **kwargs):
@@ -993,6 +1001,41 @@ class TilePrimitiveCall(Stmt):
             instance,  # pylint: disable=no-member
         )
         return new_instance
+
+    def replace(self, **changes: Any) -> "TilePrimitiveCall":
+        """Return a copy of this call with selected fields replaced.
+
+        Every field that is not overridden in ``changes`` is preserved from
+        ``self`` (including ``scope``), so rebuilds never silently drop fields.
+        The returned node is downcast to the registered subclass for ``op``.
+
+        Parameters
+        ----------
+        **changes : Any
+            Field overrides; any of ``op``, ``args``, ``workspace``, ``config``,
+            ``dispatch``, ``scope``.
+
+        Returns
+        -------
+        new_call : TilePrimitiveCall
+            A new call with the requested fields replaced.
+        """
+        unknown = set(changes) - {"op", "args", "workspace", "config", "dispatch", "scope"}
+        if unknown:
+            raise TypeError(f"Unknown field(s) for TilePrimitiveCall.replace: {sorted(unknown)}")
+        new_call = TilePrimitiveCall(
+            *changes.get("args", self.args),
+            op=changes.get("op", self.op),
+            workspace=changes.get("workspace", self.workspace),
+            config=changes.get("config", self.config),
+            dispatch=changes.get("dispatch", self.dispatch),
+            scope=changes.get("scope", self.scope),
+        )
+        return TilePrimitiveCall.downcast(new_call)
+
+    def with_workspace(self, workspace: dict[str, Buffer]) -> "TilePrimitiveCall":
+        """Return a copy with ``workspace`` replaced, preserving all other fields."""
+        return self.replace(workspace=workspace)
 
     @property
     def srcs(self) -> list[PrimExpr]:

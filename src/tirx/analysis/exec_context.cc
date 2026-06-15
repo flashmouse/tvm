@@ -55,7 +55,7 @@ bool TryAsInt64(const PrimExpr& expr, int64_t* value) {
 
 bool IsZero(const PrimExpr& expr) {
   arith::Analyzer analyzer;
-  return analyzer.CanProveEqual(expr, 0);
+  return analyzer->CanProveEqual(expr, 0);
 }
 
 ActiveSet MakeActiveSet(const std::vector<std::pair<std::string, AxisRange>>& axes) {
@@ -584,14 +584,6 @@ bool ScopeSwitch(const ActiveSet& A, ScopeKind scope_kind, ExecSplit* out, std::
       AddCtaAxes(A, &out->inter);
       return true;
     }
-    case ScopeKind::kKernel:
-      out->inter["laneid"] = laneid;
-      out->inter["warpid"] = warpid;
-      AddCtaAxes(A, &out->inter);
-      return true;
-    case ScopeKind::kWorld:
-      *err = "scope_switch(world) is not a valid ExecContext transition";
-      return false;
   }
   *err = "unknown ScopeKind";
   return false;
@@ -606,7 +598,7 @@ ExecContext ExecContext::AtKernelEntry(
     const std::vector<std::pair<std::string, int64_t>>& cta_axes) {
   ExecContext ctx;
   ctx.A = InitialActiveSet(lane_ext, warp_ext, cta_ext, cta_axes);
-  ctx.scope_kind = ScopeKind::kKernel;
+  ctx.scope_kind = ScopeKind::kThread;
   std::string err;
   bool ok = ScopeSwitch(ctx.A, ctx.scope_kind, &ctx.split, &err);
   (void)ok;
@@ -664,16 +656,6 @@ bool ExecContext::WithCtaAxisModulo(const std::string& axis, int64_t modulus, in
   if (!ScopeSwitch(new_A, scope_kind, &new_split, err)) return false;
   out->A = std::move(new_A);
   out->scope_kind = scope_kind;
-  out->split = std::move(new_split);
-  return true;
-}
-
-bool ExecContext::WithScopeSwitch(ScopeKind new_scope_kind, ExecContext* out,
-                                  std::string* err) const {
-  ExecSplit new_split;
-  if (!ScopeSwitch(A, new_scope_kind, &new_split, err)) return false;
-  out->A = A;
-  out->scope_kind = new_scope_kind;
   out->split = std::move(new_split);
   return true;
 }

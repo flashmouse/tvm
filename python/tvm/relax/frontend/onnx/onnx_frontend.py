@@ -46,10 +46,18 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as _np
-import onnx.onnx_ml_pb2
+
+try:
+    import onnx.onnx_ml_pb2
+except ImportError as err:
+    raise ImportError(
+        "onnx is required by the ONNX frontend. Install it with: pip install onnx"
+    ) from err
+
+import tvm_ffi
 
 import tvm
-from tvm import TVMError, relax, tirx, topi
+from tvm import relax, tirx, topi
 from tvm.ir import IRModule
 from tvm.ir.supply import NameSupply
 from tvm.runtime import DataType, DataTypeCode
@@ -63,7 +71,7 @@ def _relax_dtype_is_floating_point(dtype: str) -> bool:
     """Whether a Relax dtype string is a floating point type."""
     try:
         code = DataType(dtype).type_code
-    except (ValueError, TypeError, TVMError):
+    except (ValueError, TypeError, RuntimeError):
         return False
     return (
         code == DataTypeCode.FLOAT
@@ -529,7 +537,7 @@ class Div(BinaryBase):
         try:
             lhs_code = DataType(inputs[0].struct_info.dtype).type_code
             rhs_code = DataType(inputs[1].struct_info.dtype).type_code
-        except (AttributeError, ValueError, TypeError, TVMError):
+        except (AttributeError, ValueError, TypeError, RuntimeError):
             return cls.base_impl(bb, inputs, attr, params)
 
         lhs_is_integer = lhs_code == DataTypeCode.INT or lhs_code == DataTypeCode.UINT
@@ -661,7 +669,7 @@ class Equal(OnnxOpConverter):
             rhs = get_prim_expr_list(inputs[1])
             if len(lhs) != len(rhs):
                 raise ValueError("Cannot compare two tensors with different shapes")
-            output = [tvm.ir.structural_equal(l, r) for l, r in zip(lhs, rhs)]
+            output = [tvm_ffi.structural_equal(l, r) for l, r in zip(lhs, rhs)]
             return relax.const(output, "bool")
         return relax.op.equal(inputs[0], inputs[1])
 
@@ -1104,6 +1112,63 @@ class Cast(OnnxOpConverter):
             return relax.const(output, to_type)
         if isinstance(inputs[0], relax.PrimValue):
             return relax.PrimValue(inputs[0].value.astype(to_type))
+
+        try:
+            np_dst = _np.dtype(str(to_type))
+        except Exception:
+            return relax.op.astype(inputs[0], to_type)
+
+        if np_dst.kind in ("i", "u"):
+            src = inputs[0]
+            src_dtype = getattr(getattr(src, "struct_info", None), "dtype", None) or getattr(
+                src, "dtype", None
+            )
+            if src_dtype is not None and _relax_dtype_is_floating_point(src_dtype):
+                x_sanitized = bb.emit(
+                    relax.op.where(
+                        relax.op.logical_not(relax.op.isfinite(src)),
+                        relax.const(0.0, src_dtype),
+                        src,
+                    )
+                )
+                dst_str = str(to_type)
+                if dst_str.startswith("uint"):
+                    signed = False
+                    bits = int(dst_str[4:])
+                elif dst_str.startswith("int"):
+                    signed = True
+                    bits = int(dst_str[3:])
+                else:
+                    return relax.op.astype(x_sanitized, to_type)
+
+                if bits == 64:
+                    return relax.op.astype(x_sanitized, to_type)
+
+                temp_dtype = "int64" if bits >= 32 else "int32"
+                t = relax.op.astype(x_sanitized, temp_dtype)
+                if bits == 32:
+                    two_pow = relax.const(1 << bits, temp_dtype)
+                    uw = relax.op.floor_mod(t, two_pow)
+                else:
+                    mask_val = (1 << bits) - 1
+                    mask = relax.const(mask_val, temp_dtype)
+                    uw = relax.op.bitwise_and(t, mask)
+                if signed:
+                    half = 1 << (bits - 1)
+                    half_c = relax.const(half, temp_dtype)
+                    if bits == 32:
+                        two_pow = relax.const(1 << bits, temp_dtype)
+                    else:
+                        two_pow = relax.op.add(mask, relax.const(1, temp_dtype))
+                    wrapped = relax.op.where(
+                        relax.op.greater_equal(uw, half_c),
+                        relax.op.subtract(uw, two_pow),
+                        uw,
+                    )
+                else:
+                    wrapped = uw
+                return relax.op.astype(wrapped, to_type)
+
         return relax.op.astype(inputs[0], to_type)
 
 
@@ -1840,7 +1905,7 @@ class CumSum(OnnxOpConverter):
     def _impl_v14(cls, bb, inputs, attr, params):
         data = inputs[0]
         axis_input = get_constant(inputs[1], params)
-        assert not attr.get("exclusive", False), "Exclusive option not yet supported."
+        exclusive = attr.get("exclusive", 0) != 0
 
         if isinstance(axis_input, relax.Constant):
             axis_data = axis_input.data.numpy()
@@ -1868,7 +1933,7 @@ class CumSum(OnnxOpConverter):
         if attr.get("reverse", 0) != 0:
             data = bb.emit_te(topi.flip, data, axis=axis)
 
-        data = relax.op.cumsum(data, axis)
+        data = relax.op.cumsum(data, axis, exclusive=exclusive)
         data = bb.normalize(data)
 
         if attr.get("reverse", 0) != 0:
@@ -3769,8 +3834,7 @@ class LayerNormalization(OnnxOpConverter):
         gamma_shape = get_const_tuple(scale.struct_info.shape)
 
         if bias is None:
-            seq_len = data.struct_info.shape[1].value
-            bias = relax.const([0.0] * seq_len, dtype="float32")
+            bias = relax.const(_np.zeros(gamma_shape), dtype=scale.struct_info.dtype)
         else:
             beta_shape = get_const_tuple(bias.struct_info.shape)
             if gamma_shape != beta_shape:
@@ -4530,7 +4594,12 @@ class Sign(OnnxOpConverter):
 
     @classmethod
     def _impl_v9(cls, bb, inputs, attr, params):
-        return relax.op.sign(inputs[0])
+        x = inputs[0]
+        x_dtype = x.struct_info.dtype if isinstance(x.struct_info, relax.TensorStructInfo) else None
+        y = relax.op.sign(x)
+        if x_dtype is not None and _relax_dtype_is_floating_point(x_dtype):
+            return relax.op.where(relax.op.isnan(x), x, y)
+        return y
 
 
 class Not(OnnxOpConverter):
@@ -5506,7 +5575,7 @@ class ONNXGraphImporter:
                 # Create struct information for the new operator.
                 if isinstance(op, relax.Expr):
                     op = self.bb.normalize(op)
-            except TVMError as err:
+            except Exception as err:  # pylint: disable=broad-exception-caught
                 print(f"Error converting operator {op_name}, with inputs: {inputs}")
                 raise err
 

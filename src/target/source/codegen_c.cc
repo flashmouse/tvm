@@ -30,6 +30,7 @@
 #include <iomanip>
 
 #include "../../arith/pattern_match.h"
+#include "../../tirx/ir/buffer_common.h"
 #include "codegen_params.h"
 
 namespace tvm {
@@ -42,6 +43,7 @@ void CodeGenC::Init(bool output_ssa) { print_ssa_form_ = output_ssa; }
 void CodeGenC::InitFuncState(const PrimFunc& f) {
   alloc_storage_scope_.clear();
   handle_data_type_.clear();
+  pointer_offset_vars_.clear();
   CodeGenSourceBase::ClearFuncState();
   ReserveKeywordsAsUnique();
 }
@@ -395,6 +397,16 @@ void CodeGenC::RegisterHandleType(const VarNode* buf_var, DataType t) {
   }
 }
 
+void CodeGenC::RegisterHandleTypeFromPointer(const tirx::Var& var, const PrimExpr* value) {
+  if (value == nullptr) return;
+  auto* call = value->as<tirx::CallNode>();
+  if (call == nullptr || !call->op.same_as(builtin::ptr_byte_offset())) return;
+  std::optional<DataType> value_dtype = tirx::GetPointerType(GetType(*value));
+  if (!value_dtype.has_value()) return;
+  RegisterHandleType(var.get(), value_dtype.value());
+  pointer_offset_vars_.insert(var.get());
+}
+
 void CodeGenC::PrintVecElemLoad(const std::string& vec, DataType t, int i,
                                 std::ostream& os) {  // NOLINT(*)
   os << vec << ".s" << std::hex << i << std::dec;
@@ -708,7 +720,15 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       if (load) {
         TVM_FFI_ICHECK_EQ(load->indices.size(), 1)
             << "CodeGenC only supports flat memory allocations.";
-        os << "(&(" << GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]) << "))";
+        const VarNode* data = load->buffer->data.get();
+        if (pointer_offset_vars_.count(data) && HandleTypeMatch(data, load->buffer->dtype) &&
+            !IsVolatile(data)) {
+          os << "(" << GetVarID(data) << " + ";
+          this->PrintExpr(load->indices[0], os);
+          os << ")";
+        } else {
+          os << "(&(" << GetBufferRef(load->dtype, load->buffer.get(), load->indices[0]) << "))";
+        }
       } else {
         auto* var = op->args[0].as<tirx::VarNode>();
         TVM_FFI_ICHECK(var)
@@ -738,6 +758,15 @@ void CodeGenC::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT(*)
       os << "(";
       this->PrintExpr(op->args[0], os);
       os << " == NULL)";
+    } else if (op->op.same_as(builtin::ptr_byte_offset())) {
+      TVM_FFI_ICHECK_EQ(op->args.size(), 3U);
+      os << "((";
+      PrintType(op->args[2].dtype(), os);
+      os << "*)(((char*)";
+      this->PrintExpr(op->args[0], os);
+      os << ") + ";
+      this->PrintExpr(op->args[1], os);
+      os << "))";
     } else if (op->op.same_as(builtin::handle_add_byte_offset())) {
       TVM_FFI_ICHECK_EQ(op->args.size(), 2U);
       os << "((void*)((char*)";
@@ -807,8 +836,6 @@ void CodeGenC::VisitStmt_(const DeclBufferNode* op) {
   // DeclBuffer is a flat statement with no body — nothing to emit.
 }
 
-void CodeGenC::VisitStmt_(const ExecScopeStmtNode* op) { this->PrintStmt(op->body); }
-
 void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLINT(*)
   TVM_FFI_ICHECK_EQ(op->indices.size(), 1) << "Load from non-flat memory not supported.";
   TVM_FFI_ICHECK(!op->predicate.defined()) << "Predicated buffer load is not supported.";
@@ -839,7 +866,7 @@ void CodeGenC::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLI
     if (arith::ramp(base, 1, op->dtype.lanes()).Match(index)) {
       const RampNode* ramp = index.as<RampNode>();
       TVM_FFI_ICHECK(ramp);
-      arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
+      arith::ModularSet me = arith::Analyzer()->modular_set(ramp->base);
       // The condition: {k * coeff + base} divisible by the alignment for any k
       if (me->coeff % op->dtype.lanes() == 0 && me->base % op->dtype.lanes() == 0) {
         can_vector_load = true;
@@ -949,6 +976,7 @@ void CodeGenC::VisitExpr_(const LetNode* op, std::ostream& os) {  // NOLINT(*)
   } else {
     let_binding_[op->var] = op;
   }
+  RegisterHandleTypeFromPointer(op->var, &op->value);
   std::string value = PrintExpr(op->value);
   if (print_ssa_form_) {
     TVM_FFI_ICHECK(!var_idmap_.count(op->var.get()));
@@ -1073,6 +1101,7 @@ void CodeGenC::VisitExpr_(const SelectNode* op, std::ostream& os) {  // NOLINT(*
 }
 
 void CodeGenC::VisitStmt_(const BindNode* op) {
+  RegisterHandleTypeFromPointer(op->var, &op->value);
   std::string value = PrintExpr(op->value);
   if (print_ssa_form_) {
     TVM_FFI_ICHECK(!var_idmap_.count(op->var.get()));
@@ -1212,7 +1241,7 @@ void CodeGenC::VisitStmt_(const AssertStmtNode* op) {
 
 void CodeGenC::VisitStmt_(const ForNode* op) {
   std::string begin_str = PrintExpr(op->min);
-  PrimExpr end = is_zero(op->min) ? op->extent : arith::Analyzer().Simplify(op->min + op->extent);
+  PrimExpr end = is_zero(op->min) ? op->extent : arith::Analyzer()->Simplify(op->min + op->extent);
   std::string end_str = PrintExpr(end);
   std::string step_str = op->step.has_value() ? PrintExpr(*op->step) : "";
   PrintIndent();

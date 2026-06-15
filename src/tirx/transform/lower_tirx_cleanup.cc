@@ -42,41 +42,12 @@
 namespace tvm {
 namespace tirx {
 
-class DispatchContextRemover : public StmtExprMutator {
- public:
-  static Stmt Remove(const Stmt& stmt) { return DispatchContextRemover()(stmt); }
-
- private:
-  Stmt VisitStmt_(const ExecScopeStmtNode* op) final {
-    Stmt body = VisitStmt(op->body);
-    // Strip TIRX dispatch AttrStmts from ExecScopeStmt body
-    // (These are dead-code annotations that were never written but the cleanup pass
-    //  historically erased: scope_id_extent_map, thread_var_map, tirx.warp_id_in_cta)
-    auto strip = [](Stmt stmt) {
-      while (auto attr = stmt.as<AttrStmtNode>()) {
-        if (attr->attr_key == "scope_id_extent_map" || attr->attr_key == "thread_var_map" ||
-            attr->attr_key == "tirx.warp_id_in_cta") {
-          stmt = attr->body;
-        } else {
-          break;
-        }
-      }
-      return stmt;
-    };
-    body = strip(body);
-    if (body.same_as(op->body)) {
-      return ffi::GetRef<Stmt>(op);
-    }
-    return ExecScopeStmt(op->exec_scope, body);
-  }
-};
-
 class LayoutApplier : public arith::IRMutatorWithAnalyzer {
  public:
   static std::pair<Stmt, ffi::Map<Var, Buffer>> Flatten(
       const Stmt& stmt, const ffi::Map<tirx::Var, Buffer> buffer_map, const Target& target) {
     arith::Analyzer ana;
-    LayoutApplier storage_lower(&ana, target);
+    LayoutApplier storage_lower(ana.get(), target);
     std::unordered_map<Var, Buffer> new_buffer_map;
     std::vector<Buffer> param_flattened_buffers;
     for (const auto& kv : buffer_map) {
@@ -101,7 +72,7 @@ class LayoutApplier : public arith::IRMutatorWithAnalyzer {
   using IRMutatorWithAnalyzer::VisitExpr_;
   using IRMutatorWithAnalyzer::VisitStmt_;
 
-  explicit LayoutApplier(arith::Analyzer* analyzer, const Target& target)
+  explicit LayoutApplier(arith::AnalyzerObj* analyzer, const Target& target)
       : arith::IRMutatorWithAnalyzer(analyzer), target_(target) {}
 
   ffi::Any VisitAny(const ffi::Any& any) {
@@ -187,7 +158,7 @@ class LayoutApplier : public arith::IRMutatorWithAnalyzer {
         }
         flattened = buf;
         writer = flattened.CopyOnWrite();
-        writer->shape = {ana.Simplify(mem_span)};
+        writer->shape = {ana->Simplify(mem_span)};
         writer->strides = {};
         writer->axis_separators = {};
       } else {
@@ -389,7 +360,6 @@ Pass LowerTIRxCleanup() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     Target target = ResolveTarget(f);
     auto* n = f.CopyOnWrite();
-    n->body = DispatchContextRemover::Remove(n->body);
     std::tie(n->body, n->buffer_map) = LayoutApplier::Flatten(n->body, n->buffer_map, target);
     n->body = BufferOffsetRemover::Remove(n->body);
     return f;

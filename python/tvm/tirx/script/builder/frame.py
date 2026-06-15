@@ -34,16 +34,6 @@ class PrimFuncFrame(TIRFrame): ...
 class SBlockFrame(TIRFrame): ...
 
 
-@_register_object("script.ir_builder.tirx.ExecScopeFrame")
-class ExecScopeFrame(TIRFrame):
-    """A frame that represents an execution scope (e.g. cta, warp, thread).
-
-    When exiting this frame, it produces an ExecScopeStmt wrapping the body.
-    To narrow execution to a subset of the scope, wrap the ``with`` in an
-    ``if T.filter(var, lo, hi):`` guard.
-    """
-
-
 @_register_object("script.ir_builder.tirx.SBlockInitFrame")
 class BlockInitFrame(TIRFrame): ...
 

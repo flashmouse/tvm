@@ -25,10 +25,15 @@ import tvm
 from tvm.arith import Analyzer
 from tvm.ir import assert_structural_equal
 from tvm.ir.type import PointerType, PrimType
-from tvm.script import tirx as Tx
+from tvm.script import tirx as T
 from tvm.script.ir_builder import IRBuilder
 from tvm.script.ir_builder import tirx as Tx_builder
 from tvm.tirx import Var
+from tvm.tirx.cuda.operator.tile_primitive.tma_utils import (
+    SwizzleMode,
+    mma_shared_layout,
+    tma_shared_layout,
+)
 from tvm.tirx.layout import (
     Axis,
     ComposeLayout,
@@ -41,7 +46,6 @@ from tvm.tirx.layout import (
     TileLayout,
     laneid,
     m,
-    pid,
     tid_in_wg,
     tx,
     warpid,
@@ -49,15 +53,9 @@ from tvm.tirx.layout import (
     wgid,
     wid_in_wg,
 )
-from tvm.tirx.operator.tile_primitive.cuda.tma_utils import (
-    SwizzleMode,
-    mma_shared_layout,
-    tma_shared_layout,
-)
 
 
 def test_axis():
-    assert Axis.pid == Axis.get("pid")
     assert Axis.bx == Axis.get("bx")
     assert Axis.by == Axis.get("by")
     assert Axis.bz == Axis.get("bz")
@@ -76,7 +74,6 @@ def test_axis():
     assert Axis.TCol == Axis.get("TCol")
     assert Axis.TLane == Axis.get("TLane")
 
-    assert Axis.pid.is_thread()
     assert Axis.bx.is_thread()
     assert Axis.by.is_thread()
     assert Axis.bz.is_thread()
@@ -95,9 +92,7 @@ def test_axis():
     assert Axis.TCol.is_memory()
     assert Axis.TLane.is_memory()
 
-    assert Axis.pid.get_scope().name == "world"
-    assert Axis.pid.get_subscope().name == "kernel"
-    assert Axis.bx.get_scope().name == "kernel"
+    assert Axis.bx.get_scope().name == "thread"
     assert Axis.bx.get_subscope().name == "cta"
 
 
@@ -269,13 +264,6 @@ def test_verify_well_formed():
         assert layout.verify_well_formed()
 
         layout = TileLayout(S[(2, 8, 2, 4, 2) : (2 @ wgid, 4 @ laneid, 1 @ wgid, 1 @ laneid, 1)])
-        with pytest.raises(Exception):
-            layout.verify_well_formed()
-
-        layout = TileLayout(
-            S[(2, 8, 2, 4, 2) : (2 @ warpid, 4 @ laneid, 1 @ warpid, 1 @ laneid, 1)]
-            + R[4 : 1 @ pid]
-        )
         with pytest.raises(Exception):
             layout.verify_well_formed()
 
@@ -976,9 +964,9 @@ def test_shard_layout():
 
     def case_replicate():
         layout = TileLayout(S[(64, 128) : (128, 1)])
-        layout_rep = TileLayout(S[2 : 2 @ pid] + R[2 : 1 @ pid])
+        layout_rep = TileLayout(S[2 : 2 @ warpid] + R[2 : 1 @ warpid])
         res = layout.tile(layout_rep, [2, 1], [64, 128])
-        layout_expected = TileLayout(S[(2, 8192) : (2 @ pid, 1)] + R[2 : 1 @ pid])
+        layout_expected = TileLayout(S[(2, 8192) : (2 @ warpid, 1)] + R[2 : 1 @ warpid])
         assert_structural_equal(res.canonicalize(), layout_expected.canonicalize())
 
         outer = layout.is_tile_inner(res, [128, 128], [64, 128])
@@ -1436,7 +1424,7 @@ def test_pool_allocator_alloc_mma():
     def alloc_layout(shape, dtype, swizzle_mode="auto"):
         with IRBuilder():
             with Tx_builder.prim_func():
-                pool = Tx.SMEMPool(Var("smem_ptr", PointerType(PrimType("uint8"))))
+                pool = T.SMEMPool(Var("smem_ptr", PointerType(PrimType("uint8"))))
                 buf = pool.alloc_mma(shape, dtype, swizzle_mode=swizzle_mode)
         return buf.layout
 

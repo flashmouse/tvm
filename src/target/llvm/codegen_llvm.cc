@@ -220,7 +220,7 @@ void CodeGenLLVM::InitFuncState() {
   alias_var_set_.clear();
   alloc_storage_info_.clear();
   volatile_buf_.clear();
-  analyzer_.reset(new arith::Analyzer());
+  analyzer_ = arith::Analyzer();
 }
 
 std::tuple<std::string, llvm::Function::LinkageTypes> CodeGenLLVM::GetLinkage(
@@ -597,11 +597,10 @@ llvm::Type* CodeGenLLVM::GetLLVMType(const Type& type) const {
   if (auto* ptr = type.as<PrimTypeNode>()) {
     return DTypeToLLVMType(ptr->dtype);
   } else if (auto* ptr = type.as<PointerTypeNode>()) {
-    // LLVM IR doesn't allow void*, nor do we require custom datatypes
-    // to have LLVM equivalents, so we need to recognize these
-    // patterns explicitly.
+    // LLVM IR doesn't allow void*, so pointer element types that do not
+    // have an LLVM scalar equivalent need explicit handling.
     if (auto* primtype = ptr->element_type.as<PrimTypeNode>()) {
-      if (primtype->dtype.is_void() || primtype->dtype.code() >= DataType::kCustomBegin) {
+      if (primtype->dtype.is_void()) {
         return t_void_p_;
       }
     } else if (ptr->element_type->IsInstance<TensorMapTypeNode>()) {
@@ -2111,8 +2110,6 @@ void CodeGenLLVM::VisitStmt_(const SeqStmtNode* op) {
 }
 
 void CodeGenLLVM::VisitStmt_(const DeclBufferNode* op) { EmitDebugLocation(op); }
-
-void CodeGenLLVM::VisitStmt_(const ExecScopeStmtNode* op) { VisitStmt(op->body); }
 
 void CodeGenLLVM::VisitStmt_(const EvaluateNode* op) {
   EmitDebugLocation(op);

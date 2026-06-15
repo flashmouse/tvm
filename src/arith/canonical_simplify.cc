@@ -83,7 +83,7 @@ inline PrimExpr DivImpl(PrimExpr a, PrimExpr b, DivMode mode) {
  * \param analyzer The analyzer
  * \return whether value fits in dtype
  */
-bool CastIsSafe(DataType dtype, PrimExpr value, Analyzer* analyzer) {
+bool CastIsSafe(DataType dtype, PrimExpr value, AnalyzerObj* analyzer) {
   if (!IsIndexType(dtype)) {
     return false;
   }
@@ -156,7 +156,7 @@ class SplitExprNode : public CanonicalExprNode {
    * \param analyzer The analyzer
    * \return whether the cast can be safely pushed to children
    */
-  bool CanPushCastToChildren(DataType dtype, Analyzer* analyzer) const {
+  bool CanPushCastToChildren(DataType dtype, AnalyzerObj* analyzer) const {
     // cast(dtype, index % upper_factor / lower_factor * scale) ==
     // cast(dtype, index) % upper_factor / lower_factor * scale
     // iff it is an upcast (dtype.bits >= self.dtype.bits) or all of
@@ -334,7 +334,7 @@ class SumExprNode : public CanonicalExprNode {
    * \param analyzer The analyzer
    * \return whether the cast can be safely pushed to children
    */
-  bool CanPushCastToChildren(DataType dtype, Analyzer* analyzer) const {
+  bool CanPushCastToChildren(DataType dtype, AnalyzerObj* analyzer) const {
     bool is_min_value = dtype.bits() == 64 ? base == std::numeric_limits<int64_t>::lowest()
                                            : base == -(1LL << (dtype.bits() - 1));
     // cast(dtype, arg_1 + arg_2 + ... arg_n) ==
@@ -545,7 +545,7 @@ class CanonicalSimplifier::Impl : public RewriteSimplifier::Impl {
  public:
   using Rewriter = RewriteSimplifier::Impl;
 
-  explicit Impl(Analyzer* parent) : Rewriter(parent) {}
+  explicit Impl(AnalyzerObj* parent) : Rewriter(parent) {}
 
   PrimExpr CanonicalSimplify(PrimExpr expr) {
     expr = operator()(expr);
@@ -1419,10 +1419,17 @@ PrimExpr CanonicalSimplifier::Impl::VisitExpr_(const LTNode* op) {
       // Case 1. 0 <= xn < d
       divisible.CopyOnWrite()->DivideBy(gcd);
       return Rewriter::VisitExpr(divisible->Normalize() < make_zero(dtype));
-    } else if (extra->args.size() == 1 &&
+    } else if (extra->args.size() == 1 && extra->args[0]->scale == 1 &&
                extra->args[0]->upper_factor != ConstIntBoundNode::kPosInf &&
                extra->args[0]->upper_factor % (gcd * extra->args[0]->lower_factor) == 0) {
-      // Case 2. xn == yn % m, where m % d == 0
+      // Case 2. xn == ((yn % m) // L), scale = +1, m % (d*L) == 0.
+      // S + xn < 0 with S divisible by d  ⇔  S/d + xn // d < 0, because
+      // xn % d ∈ [0, d) lets us drop the remainder via the Case 1 argument,
+      // and xn // d = (yn // (d*L)) % (m/(d*L)).
+      // The scale must be +1: with scale = -1 the equivalence becomes ≤
+      // rather than <, so the rewrite would strengthen the predicate and
+      // silently drop the boundary S/d == xn // d (e.g. row > col where
+      // row and col are independent projections of the same lane id).
       divisible.CopyOnWrite()->DivideBy(gcd);
       const auto split_expr = extra->args[0];
       int64_t lower_factor = gcd * extra->args[0]->lower_factor;
@@ -1443,7 +1450,7 @@ void CanonicalSimplifier::Update(const Var& var, const PrimExpr& info, bool over
   impl_->Update(var, info, override);
 }
 
-CanonicalSimplifier::CanonicalSimplifier(Analyzer* parent) : impl_(new Impl(parent)) {}
+CanonicalSimplifier::CanonicalSimplifier(AnalyzerObj* parent) : impl_(new Impl(parent)) {}
 
 CanonicalSimplifier::~CanonicalSimplifier() { delete impl_; }
 

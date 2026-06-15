@@ -19,6 +19,7 @@
 
 #include "ccl.h"
 
+#include <tvm/ffi/extra/visit_error_context.h>
 #include <tvm/ffi/reflection/registry.h>
 
 #include <utility>
@@ -146,17 +147,16 @@ StructInfo InferStructInfoScatter(const Call& call, const BlockBuilder& ctx) {
   const auto* attrs = call->attrs.as<ScatterCollectiveAttrs>();
   int num_workers = attrs->num_workers;
 
-  arith::Analyzer* analyzer = ctx->GetAnalyzer();
+  arith::Analyzer analyzer = ctx->GetAnalyzer();
   auto input_shape = input_sinfo->GetShape();
   TVM_FFI_ICHECK(input_shape.defined())
       << "input tensor of scatter_from_worker0 should have defined shape.";
 
   if (analyzer->CanProve(floormod(input_shape.value()[attrs->axis], PrimExpr(num_workers)) != 0)) {
-    ctx->ReportFatal(Diagnostic::Error(call)
-                     << "scatter_from_worker0 expects the size of axis " << attrs->axis
-                     << " of input tensor to be divisible by the num_workers. However, axis "
-                     << attrs->axis << " of input tensor is " << input_shape.value()
-                     << " while num_workers is " << num_workers);
+    TVM_FFI_VISIT_THROW(ValueError, call)
+        << "scatter_from_worker0 expects the size of axis " << attrs->axis
+        << " of input tensor to be divisible by the num_workers. However, axis " << attrs->axis
+        << " of input tensor is " << input_shape.value() << " while num_workers is " << num_workers;
   }
 
   ffi::Array<PrimExpr> output_shape = input_shape.value();

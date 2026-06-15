@@ -17,6 +17,7 @@
  * under the License.
  */
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/op.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/builtin.h>
 #include <tvm/tirx/exec_scope.h>
@@ -29,10 +30,6 @@ namespace tirx {
 
 std::string ScopeKindToString(ScopeKind kind) {
   switch (kind) {
-    case ScopeKind::kWorld:
-      return "world";
-    case ScopeKind::kKernel:
-      return "kernel";
     case ScopeKind::kCluster:
       return "cluster";
     case ScopeKind::kCta:
@@ -48,8 +45,6 @@ std::string ScopeKindToString(ScopeKind kind) {
 }
 
 ScopeKind StringToScopeKind(const ffi::String& name) {
-  if (name == "world") return ScopeKind::kWorld;
-  if (name == "kernel") return ScopeKind::kKernel;
   if (name == "cluster") return ScopeKind::kCluster;
   if (name == "cta") return ScopeKind::kCta;
   if (name == "warpgroup") return ScopeKind::kWarpgroup;
@@ -104,14 +99,24 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 }
 
 /******** Definition of Execution Scope ********/
-bool ScopeNameHigher(const ffi::String& a, const ffi::String& b) {
-  return ScopeKindHigher(StringToScopeKind(a), StringToScopeKind(b));
+//
+// "kernel" is retained as a structural label for the ``kKernelCluster`` /
+// ``kKernelCta`` ScopeBinding parent string, even though ``ScopeKind::kKernel``
+// no longer exists. Treat it as the virtual root: wider than every real
+// ScopeKind. Real ScopeKinds compare via ``ScopeKindHigher``.
+static constexpr int kRootScopeRank = -1;  // wider than any real ScopeKind
+static int ScopeNameRank(const ffi::String& name) {
+  if (name == "kernel") return kRootScopeRank;
+  return static_cast<int>(StringToScopeKind(name));
 }
 
-ExecScope::ExecScope(ScopeKind kind, ffi::Array<ScopeIdDef> scope_id_def) {
+bool ScopeNameHigher(const ffi::String& a, const ffi::String& b) {
+  return ScopeNameRank(a) < ScopeNameRank(b);
+}
+
+ExecScope::ExecScope(ScopeKind kind) {
   auto n = ffi::make_object<ExecScopeNode>();
   n->kind = kind;
-  n->scope_id_def = std::move(scope_id_def);
   data_ = std::move(n);
 }
 
@@ -208,7 +213,7 @@ bool ScopeIdDefVerifier::Verify(const ffi::Array<ScopeIdDef>& defs, Mode mode) {
       it->second = upgraded;
       queue.push(upgraded);
     } else if (existing_known && new_known) {
-      TVM_FFI_ICHECK(ana.CanProveEqual(existing.fused_extent(), id.fused_extent()))
+      TVM_FFI_ICHECK(ana->CanProveEqual(existing.fused_extent(), id.fused_extent()))
           << "Inconsistent extents for scope binding " << static_cast<int>(id->scope);
     }
     // else: existing wins (known beats unknown; both unknown is a no-op).
@@ -312,11 +317,11 @@ static ffi::Optional<ScopeIdDef> Compliment(const ScopeIdDef& lhs, const ScopeId
   arith::Analyzer ana;
   auto try_compliment = [&](PrimExpr lhs_ext, PrimExpr rhs_ext,
                             ScopeBinding scope) -> ffi::Optional<ScopeIdDef> {
-    if (ana.CanProve(floormod(lhs_ext, rhs_ext) == 0)) {
+    if (ana->CanProve(floormod(lhs_ext, rhs_ext) == 0)) {
       return ScopeIdDef(ffi::Array<Var>{Var("")}, ffi::Array<PrimExpr>{floordiv(lhs_ext, rhs_ext)},
                         scope);
     }
-    TVM_FFI_ICHECK(!ana.CanProve(floormod(lhs_ext, rhs_ext) != 0))
+    TVM_FFI_ICHECK(!ana->CanProve(floormod(lhs_ext, rhs_ext) != 0))
         << "ValueError: scope binding " << static_cast<int>(scope)
         << " has non-divisible extents: " << lhs_ext << " is not divisible by " << rhs_ext;
     return std::nullopt;
@@ -380,33 +385,34 @@ ffi::Array<PrimExpr> ResolveCuda(ScopeBinding binding,
     case ScopeBinding::kKernelCluster: {
       TVM_FFI_ICHECK_LE(out_dim, 3)
           << "ValueError: kernel->cluster can only have 3 dimensions for now";
+      static const Op& ptx_fetch_register_op = Op::Get("tirx.ptx.fetch_register");
       ffi::Array<PrimExpr> ret;
       for (int i = 0; i < out_dim; ++i) {
         ret.push_back(tirx::Call(
-            DataType::Int(32), builtin::ptx_fetch_register(),
+            DataType::Int(32), ptx_fetch_register_op,
             {IntImm(DataType::Int(32), 32), StringImm("clusterid." + std::string(1, 'x' + i))}));
       }
       return ret;
     }
     case ScopeBinding::kCtaWarpgroup: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: cta->warpgroup must be 1D";
-      return {ana.Simplify(FloorDiv(GetThread("warp_id_in_cta", params).first, 4))};
+      return {ana->Simplify(FloorDiv(GetThread("warp_id_in_cta", params).first, 4))};
     }
     case ScopeBinding::kCtaWarp: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: cta->warp must be 1D";
-      return {ana.Simplify(GetThread("warp_id_in_cta", params).first)};
+      return {ana->Simplify(GetThread("warp_id_in_cta", params).first)};
     }
     case ScopeBinding::kWarpgroupWarp: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: warpgroup->warp must be 1D";
-      return {ana.Simplify(FloorMod(GetThread("warp_id_in_cta", params).first, 4))};
+      return {ana->Simplify(FloorMod(GetThread("warp_id_in_cta", params).first, 4))};
     }
     case ScopeBinding::kWarpgroupThread: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: warpgroup->thread must be 1D";
-      return {ana.Simplify(FloorMod(GetLinearThreadIndex(params), 128))};
+      return {ana->Simplify(FloorMod(GetLinearThreadIndex(params), 128))};
     }
     case ScopeBinding::kWarpThread: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: warp->thread must be 1D";
-      return {ana.Simplify(FloorMod(GetLinearThreadIndex(params), 32))};
+      return {ana->Simplify(FloorMod(GetLinearThreadIndex(params), 32))};
     }
     case ScopeBinding::kClusterCtaPair: {
       TVM_FFI_ICHECK_EQ(out_dim, 1) << "ValueError: cluster->cta_pair must be 1D";
@@ -414,7 +420,7 @@ ffi::Array<PrimExpr> ResolveCuda(ScopeBinding binding,
       std::tie(cbx, ex) = GetThread("clusterCtaIdx.x", params, true);
       std::tie(cby, ey) = GetThread("clusterCtaIdx.y", params, true);
       std::tie(cbz, ez) = GetThread("clusterCtaIdx.z", params, true);
-      return {ana.Simplify(FloorMod(cbx + cby * ex + cbz * ex * ey, 2))};
+      return {ana->Simplify(FloorMod(cbx + cby * ex + cbz * ex * ey, 2))};
     }
   }
   LOG(FATAL) << "Internal Error: unknown ScopeBinding " << static_cast<int>(binding);

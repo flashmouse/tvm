@@ -14,11 +14,10 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Tests for T.inline / Tx.inline with Python LEGB scoping semantics."""
+"""Tests for T.inline / T.inline with Python LEGB scoping semantics."""
 
 from tvm.ir import assert_structural_equal
 from tvm.script import tirx as T
-from tvm.script import tirx as Tx
 
 # Module-level constant for testing global visibility
 MODULE_CONST = 42
@@ -201,28 +200,28 @@ def test_recursive_inline():
     """Recursive inline (defined inside prim_func)."""
 
     # fmt: off
-    @Tx.prim_func(private=True)
+    @T.prim_func(private=True)
     def func():
-        with Tx.kernel():
-            for x in Tx.serial(10):
+        T.device_entry()
+        for x in T.serial(10):
 
-                @Tx.inline
-                def add(x, c):
-                    if c > 0:
-                        add(x, c - 1)
-                    Tx.evaluate(x)
+            @T.inline
+            def add(x, c):
+                if c > 0:
+                    add(x, c - 1)
+                T.evaluate(x)
 
-                add(x, 3)
+            add(x, 3)
 
-    @Tx.prim_func(private=True)
+    @T.prim_func(private=True)
     def expected():
-        with Tx.kernel():
-            for x in range(10):
-                Tx.evaluate(x)
-                Tx.evaluate(x)
-                Tx.evaluate(x)
-                Tx.evaluate(x)
-    # fmt: on
+        T.device_entry()
+        for x in range(10):
+            T.evaluate(x)
+            T.evaluate(x)
+            T.evaluate(x)
+            T.evaluate(x)
+        # fmt: on
 
     assert_structural_equal(func, expected)
 

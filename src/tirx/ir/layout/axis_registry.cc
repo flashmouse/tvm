@@ -163,25 +163,24 @@ void AxisRegEntry::UpdateAttr(const ffi::String& key, ffi::Any value, int plevel
 ffi::Array<Iter> SplitterGen(const Iter& iter, const Axis& axis_outer, const Axis& axis_inner,
                              const PrimExpr& e_inner) {
   arith::Analyzer analyzer;
-  if (analyzer.CanProve(iter->extent * iter->stride < e_inner)) {
+  if (analyzer->CanProve(iter->extent * iter->stride < e_inner)) {
     return {Iter(iter->extent, iter->stride, axis_inner)};
-  } else if (analyzer.CanProveEqual(floormod(e_inner, iter->stride), 0) &&
-             analyzer.CanProveEqual(floormod(iter->extent * iter->stride, e_inner), 0)) {
-    const auto& d = analyzer.Simplify(floordiv(e_inner, iter->stride));
-    const auto& c = analyzer.Simplify(floordiv(iter->extent, d));
+  } else if (analyzer->CanProveEqual(floormod(e_inner, iter->stride), 0) &&
+             analyzer->CanProveEqual(floormod(iter->extent * iter->stride, e_inner), 0)) {
+    const auto& d = analyzer->Simplify(floordiv(e_inner, iter->stride));
+    const auto& c = analyzer->Simplify(floordiv(iter->extent, d));
     return {Iter(c, IntImm(e_inner.dtype(), 1), axis_outer), Iter(d, iter->stride, axis_inner)};
-  } else if (analyzer.CanProveEqual(floormod(iter->stride, e_inner), 0)) {
-    const auto& d = analyzer.Simplify(floordiv(iter->stride, e_inner));
+  } else if (analyzer->CanProveEqual(floormod(iter->stride, e_inner), 0)) {
+    const auto& d = analyzer->Simplify(floordiv(iter->stride, e_inner));
     return {Iter(iter->extent, d, axis_outer)};
   }
   return {};
 }
 
 // register thread axes
-TVM_REGISTER_AXIS("pid").set_attr<bool>("thread", true).set_scope("world").set_subscope("kernel");
-TVM_REGISTER_AXIS("bx").set_attr<bool>("thread", true).set_scope("kernel").set_subscope("cta");
-TVM_REGISTER_AXIS("by").set_attr<bool>("thread", true).set_scope("kernel").set_subscope("cta");
-TVM_REGISTER_AXIS("bz").set_attr<bool>("thread", true).set_scope("kernel").set_subscope("cta");
+TVM_REGISTER_AXIS("bx").set_attr<bool>("thread", true).set_scope("thread").set_subscope("cta");
+TVM_REGISTER_AXIS("by").set_attr<bool>("thread", true).set_scope("thread").set_subscope("cta");
+TVM_REGISTER_AXIS("bz").set_attr<bool>("thread", true).set_scope("thread").set_subscope("cta");
 TVM_REGISTER_AXIS("cbx").set_attr<bool>("thread", true).set_scope("cluster").set_subscope("cta");
 TVM_REGISTER_AXIS("cby").set_attr<bool>("thread", true).set_scope("cluster").set_subscope("cta");
 TVM_REGISTER_AXIS("cbz").set_attr<bool>("thread", true).set_scope("cluster").set_subscope("cta");

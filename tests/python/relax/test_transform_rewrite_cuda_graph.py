@@ -17,6 +17,7 @@
 # ruff: noqa: E501, F841
 
 import pytest
+import tvm_ffi
 
 import tvm
 import tvm.testing
@@ -474,10 +475,10 @@ def test_capture_fixed_inputs():
                     with T.init():
                         A_red_temp_v0[v_ax0, v_ax1, v_ax2] = T.float32(0)
                         A_red_temp_v1[v_ax0, v_ax1, v_ax2] = T.float32(0)
-                    v_A_red_temp_v0: T.float32 = A_red_temp_v0[v_ax0, v_ax1, v_ax2] + T.Cast(
+                    v_A_red_temp_v0: T.let[T.float32] = A_red_temp_v0[v_ax0, v_ax1, v_ax2] + T.Cast(
                         "float32", A[v_ax0, v_ax1, v_ax2, v_k3]
                     )
-                    v_A_red_temp_v1: T.float32 = A_red_temp_v1[v_ax0, v_ax1, v_ax2] + T.Cast(
+                    v_A_red_temp_v1: T.let[T.float32] = A_red_temp_v1[v_ax0, v_ax1, v_ax2] + T.Cast(
                         "float32", A[v_ax0, v_ax1, v_ax2, v_k3]
                     ) * T.Cast("float32", A[v_ax0, v_ax1, v_ax2, v_k3])
                     A_red_temp_v0[v_ax0, v_ax1, v_ax2] = v_A_red_temp_v0
@@ -703,7 +704,7 @@ def test_transform_is_no_op_when_disabled():
     with tvm.transform.PassContext(config={"relax.backend.use_cuda_graph": False}):
         AfterWhenDisabled = relax.transform.RewriteCUDAGraph()(Before)
 
-    assert not tvm.ir.structural_equal(Before, AfterWhenEnabled)
+    assert not tvm_ffi.structural_equal(Before, AfterWhenEnabled)
     tvm.ir.assert_structural_equal(Before, AfterWhenDisabled)
 
 
