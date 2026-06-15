@@ -34,3 +34,6 @@ PY
 
 export TVM_LIBRARY_PATH="$(pwd)/build/lib"
 export DYLD_LIBRARY_PATH="$(pwd)/build/lib"
+# Pin the Python sources to this checkout so they match the lib above
+# (overrides any stale editable install pointing at another worktree).
+export PYTHONPATH="$(pwd)/python${PYTHONPATH:+:$PYTHONPATH}"
